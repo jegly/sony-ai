@@ -25,6 +25,7 @@ typedef struct {
     float *ap;     /* packed weights [ceil(M/4)][K][4] for matrix-multiply convs */
     float *dw;     /* depthwise weights [c][k*k] */
     float *bias;   /* per output row (M) */
+    float *wino;   /* 3x3 stride-1 convs: Winograd F(2x2, 3x3) weights, 16 packed [ceil(M/4)][cin][4] blocks */
 } Op;
 
 typedef struct {
@@ -135,11 +136,44 @@ static float *pack_a(const float *w, int M, int K) {
     return ap;
 }
 
+/*
+ * Winograd F(2x2, 3x3): each 2x2 block of outputs comes from a 4x4 block of input with 16 multiplies per
+ * input channel instead of 36. Weights become U = G g G^T (16 values per filter); inputs V = B^T d B; the
+ * 16 products are 16 matrix multiplies (out channels x in channels x tiles); outputs Y = A^T M A.
+ */
+static float *winograd_weights(const float *w, int cout, int cin) {
+    int mb = (cout + 3) / 4;
+    size_t block = (size_t) mb * cin * 4;
+    float *u = calloc(16 * block, sizeof(float));
+    if (!u) return NULL;
+    for (int co = 0; co < cout; co++) {
+        for (int ci = 0; ci < cin; ci++) {
+            const float *g = w + ((size_t) co * cin + ci) * 9;
+            float t[4][3]; /* G g */
+            for (int j = 0; j < 3; j++) {
+                t[0][j] = g[j];
+                t[1][j] = 0.5f * (g[j] + g[3 + j] + g[6 + j]);
+                t[2][j] = 0.5f * (g[j] - g[3 + j] + g[6 + j]);
+                t[3][j] = g[6 + j];
+            }
+            for (int i = 0; i < 4; i++) { /* (G g) G^T */
+                float v[4] = {t[i][0], 0.5f * (t[i][0] + t[i][1] + t[i][2]), 0.5f * (t[i][0] - t[i][1] + t[i][2]), t[i][2]};
+                for (int j = 0; j < 4; j++) {
+                    int e = i * 4 + j;
+                    u[e * block + ((size_t) (co / 4) * cin + ci) * 4 + (co % 4)] = v[j];
+                }
+            }
+        }
+    }
+    return u;
+}
+
 void yseg_free(YSeg *m) {
     if (!m) return;
     if (m->ops) {
         for (int i = 0; i < m->nops; i++) {
             free(m->ops[i].ap);
+            free(m->ops[i].wino);
             free(m->ops[i].dw);
             free(m->ops[i].bias);
         }
@@ -215,7 +249,14 @@ YSeg *yseg_load(const void *data, size_t len, char *err, int errlen) {
             float *w = rd_halfs(&r, nw);
             op->bias = rd_floats(&r, cout);
             if (!w || !op->bias) goto oom;
-            if (groups == 1) {
+            int s1 = op->a[5] == 1 && (op->type == OP_CONV ? op->a[6] == 1 : op->a[6] == 1);
+            if (groups == 1 && k == 3 && s1) {
+                op->M = cout;
+                op->K = cin * 9;
+                op->wino = winograd_weights(w, cout, cin);
+                free(w);
+                if (!op->wino) goto oom;
+            } else if (groups == 1) {
                 op->M = cout;
                 op->K = cin * k * k;
                 op->ap = pack_a(w, op->M, op->K);
@@ -434,6 +475,113 @@ static void gather(const ConvJob *j, int pix, int npix, float *bp) {
     }
 }
 
+#define WINO_TB 64 /* tiles per block: keeps the transformed blocks in cache */
+
+/* A 3x3, stride 1, pad 1 convolution by Winograd F(2x2, 3x3). */
+static int winograd(const Op *op, const Tensor *in, Tensor *out, int act) {
+    int C = in->c, H = in->h, W = in->w, M = op->M, mb = (M + 3) / 4;
+    int TW = (W + 1) / 2, TH = (H + 1) / 2, T = TW * TH;
+    size_t block = (size_t) mb * C * 4;
+    float *V = malloc(sizeof(float) * 16 * (size_t) C * WINO_TB);       /* [e][panel][c][4] */
+    float *Mo = malloc(sizeof(float) * 16 * (size_t) mb * 4 * WINO_TB);  /* [e][m][tile] */
+    if (!V || !Mo) {
+        free(V);
+        free(Mo);
+        return -1;
+    }
+    const int NP = WINO_TB / 4;
+    float tmp[16];
+    for (int t0 = 0; t0 < T; t0 += WINO_TB) {
+        int nt = T - t0 < WINO_TB ? T - t0 : WINO_TB;
+        /* input transform */
+        for (int tb = 0; tb < WINO_TB; tb++) {
+            int panel = tb / 4, q = tb % 4;
+            if (tb >= nt) {
+                for (int e = 0; e < 16; e++)
+                    for (int c = 0; c < C; c++) V[(((size_t) e * NP + panel) * C + c) * 4 + q] = 0;
+                continue;
+            }
+            int t = t0 + tb, ty = t / TW, tx = t % TW;
+            int y0 = 2 * ty - 1, x0 = 2 * tx - 1;
+            int inside = y0 >= 0 && x0 >= 0 && y0 + 4 <= H && x0 + 4 <= W;
+            for (int c = 0; c < C; c++) {
+                const float *plane = in->d + (size_t) c * H * W;
+                float d[4][4];
+                for (int i = 0; i < 4; i++) {
+                    int yy = y0 + i;
+                    for (int j = 0; j < 4; j++) {
+                        int xx = x0 + j;
+                        d[i][j] = inside || (yy >= 0 && yy < H && xx >= 0 && xx < W) ? plane[yy * W + xx] : 0;
+                    }
+                }
+                float r[4][4]; /* B^T d */
+                for (int j = 0; j < 4; j++) {
+                    r[0][j] = d[0][j] - d[2][j];
+                    r[1][j] = d[1][j] + d[2][j];
+                    r[2][j] = d[2][j] - d[1][j];
+                    r[3][j] = d[1][j] - d[3][j];
+                }
+                for (int i = 0; i < 4; i++) { /* (B^T d) B */
+                    float v0 = r[i][0] - r[i][2], v1 = r[i][1] + r[i][2], v2 = r[i][2] - r[i][1], v3 = r[i][1] - r[i][3];
+                    float *dst = V + (((size_t) (i * 4) * NP + panel) * C + c) * 4 + q;
+                    size_t es = (size_t) NP * C * 4;
+                    dst[0] = v0;
+                    dst[es] = v1;
+                    dst[2 * es] = v2;
+                    dst[3 * es] = v3;
+                }
+            }
+        }
+        /* 16 matrix multiplies */
+        int npanels = (nt + 3) / 4;
+        for (int e = 0; e < 16; e++) {
+            const float *A = op->wino + e * block;
+            const float *Ve = V + (size_t) e * NP * C * 4;
+            float *Me = Mo + (size_t) e * mb * 4 * WINO_TB;
+            for (int b = 0; b < mb; b++) {
+                const float *a = A + (size_t) b * C * 4;
+                for (int pnl = 0; pnl < npanels; pnl++) {
+                    kernel4x4(a, Ve + (size_t) pnl * C * 4, tmp, C);
+                    for (int rr = 0; rr < 4; rr++) {
+                        float *row = Me + (size_t) (b * 4 + rr) * WINO_TB + pnl * 4;
+                        row[0] = tmp[rr * 4];
+                        row[1] = tmp[rr * 4 + 1];
+                        row[2] = tmp[rr * 4 + 2];
+                        row[3] = tmp[rr * 4 + 3];
+                    }
+                }
+            }
+        }
+        /* output transform */
+        for (int mo = 0; mo < M; mo++) {
+            float bias = op->bias[mo];
+            float *oplane = out->d + (size_t) mo * H * W;
+            for (int tb = 0; tb < nt; tb++) {
+                float mm[16];
+                for (int e = 0; e < 16; e++) mm[e] = Mo[((size_t) e * mb * 4 + mo) * WINO_TB + tb];
+                /* A^T m: rows 0..1 */
+                float s0[4], s1[4];
+                for (int j = 0; j < 4; j++) {
+                    s0[j] = mm[j] + mm[4 + j] + mm[8 + j];
+                    s1[j] = mm[4 + j] - mm[8 + j] - mm[12 + j];
+                }
+                float y00 = s0[0] + s0[1] + s0[2] + bias, y01 = s0[1] - s0[2] - s0[3] + bias;
+                float y10 = s1[0] + s1[1] + s1[2] + bias, y11 = s1[1] - s1[2] - s1[3] + bias;
+                int t = t0 + tb, oy = (t / TW) * 2, ox = (t % TW) * 2;
+                oplane[oy * W + ox] = activate(y00, act);
+                if (ox + 1 < W) oplane[oy * W + ox + 1] = activate(y01, act);
+                if (oy + 1 < H) {
+                    oplane[(oy + 1) * W + ox] = activate(y10, act);
+                    if (ox + 1 < W) oplane[(oy + 1) * W + ox + 1] = activate(y11, act);
+                }
+            }
+        }
+    }
+    free(V);
+    free(Mo);
+    return 0;
+}
+
 static void conv_part(void *ctx, int part, int parts) {
     ConvJob *j = ctx;
     const Op *op = j->op;
@@ -648,7 +796,9 @@ int yseg_run(YSeg *m, const unsigned char *rgb, int w, int h, int threads) {
                 Tensor *x = &m->t[a[0]], *y = &m->t[a[1]];
                 int k = a[4], s = a[5], p = a[6];
                 if (alloc_tensor(y, a[3], (x->h + 2 * p - k) / s + 1, (x->w + 2 * p - k) / s + 1)) return -1;
-                if (a[7] == 1) {
+                if (op->wino) {
+                    if (winograd(op, x, y, a[8])) return -1;
+                } else if (a[7] == 1) {
                     ConvJob j = {op, x, y, k, s, p, a[8], 0, y->h, y->w, 0};
                     parallel(threads, conv_part, &j);
                     if (j.failed) return -1;
@@ -670,7 +820,9 @@ int yseg_run(YSeg *m, const unsigned char *rgb, int w, int h, int threads) {
                     p = total > 0 ? total / 2 : 0;
                 }
                 if (alloc_tensor(y, a[3], oh, ow)) return -1;
-                if (a[7] == 1) {
+                if (op->wino) {
+                    if (winograd(op, x, y, a[8])) return -1;
+                } else if (a[7] == 1) {
                     ConvJob j = {op, x, y, k, s, p, a[8], 0, oh, ow, 0};
                     parallel(threads, conv_part, &j);
                     if (j.failed) return -1;
