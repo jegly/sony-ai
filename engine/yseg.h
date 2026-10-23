@@ -28,6 +28,11 @@ int yseg_people(YSeg *m, float conf, float iou, unsigned char *mask, int max_peo
  * across the wanted classes together. */
 int yseg_objects(YSeg *m, float conf, float iou, unsigned char *mask, int max_objects, const unsigned char *classes);
 
+/* After yseg_run with a pose model (yolo11n-pose): the people found, best first, up to max. Each is 56
+ * floats: x1 y1 x2 y2 score, then 17 COCO keypoints as x y visibility (input pixels, visibility 0..1).
+ * Returns how many, or -1 if this isn't a pose model or memory ran out. */
+int yseg_pose(YSeg *m, float conf, float iou, float *out, int max);
+
 /* After yseg_people: the people's boxes (x1 y1 x2 y2 score in input pixels, best first), up to max.
  * Returns how many. */
 int yseg_boxes(YSeg *m, float *out, int max);

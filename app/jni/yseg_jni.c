@@ -83,6 +83,36 @@ JNIEXPORT jint JNICALL Java_com_ghosts_app_Yseg_nativeRunRaw(JNIEnv *env, jclass
     return off;
 }
 
+/* Runs a pose model and returns the people found: 56 floats each (box, score, 17 x keypoint x y vis). */
+JNIEXPORT jfloatArray JNICALL Java_com_ghosts_app_Yseg_nativePose(JNIEnv *env, jclass cls, jint handle, jbyteArray jrgb,
+        jint w, jint h, jfloat conf) {
+    YSeg *m = (YSeg *) (intptr_t) handle;
+    if ((*env)->GetArrayLength(env, jrgb) < w * h * 3) {
+        throw_error(env, "buffer too small");
+        return NULL;
+    }
+    unsigned char *rgb = malloc((size_t) w * h * 3);
+    float *poses = malloc(sizeof(float) * 56 * 64);
+    if (!rgb || !poses) {
+        free(rgb);
+        free(poses);
+        throw_error(env, "out of memory");
+        return NULL;
+    }
+    (*env)->GetByteArrayRegion(env, jrgb, 0, w * h * 3, (jbyte *) rgb);
+    int n = yseg_run(m, rgb, w, h, 1) == 0 ? yseg_pose(m, conf, 0.7f, poses, 64) : -1;
+    free(rgb);
+    if (n < 0) {
+        free(poses);
+        throw_error(env, "out of memory running the pose model");
+        return NULL;
+    }
+    jfloatArray out = (*env)->NewFloatArray(env, n * 56);
+    if (out && n > 0) (*env)->SetFloatArrayRegion(env, out, 0, n * 56, poses);
+    free(poses);
+    return out;
+}
+
 /* Runs the model on rgb (w*h*3 bytes) and writes the people mask (w*h) into mask.
  * Returns the number of people. timings (9 doubles, may be null) gets ms per op type. */
 JNIEXPORT jint JNICALL Java_com_ghosts_app_Yseg_nativeRun(JNIEnv *env, jclass cls, jint handle, jbyteArray jrgb,

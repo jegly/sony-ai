@@ -834,8 +834,10 @@ void yseg_timings(YSeg *m, double *ms, int n) {
 
 typedef struct {
     float score, x1, y1, x2, y2;
-    const float *coef; /* 32 mask coefficients, strided by stride */
+    const float *coef; /* 32 mask coefficients (or 51 keypoint values), strided by cstride */
     int cstride;
+    int gx, gy;   /* the anchor's grid cell */
+    float stride;
 } Det;
 
 static int by_score(const void *a, const void *b) {
@@ -866,8 +868,9 @@ int yseg_people(YSeg *m, float conf, float iou_max, unsigned char *mask, int max
     return yseg_objects(m, conf, iou_max, mask, max_people, NULL);
 }
 
-int yseg_objects(YSeg *m, float conf, float iou_max, unsigned char *mask, int max_people, const unsigned char *classes) {
-    if (m->nout != 10) return -1;
+/* Decodes the boxes of the wanted classes, best first after NMS. Each Det's coef points at the third
+ * output of its scale (mask coefficients, or keypoints for a pose model). Returns how many, or -1. */
+static int detect(YSeg *m, float conf, float iou_max, int max_people, const unsigned char *classes, Det **out) {
     float logit_min = logf(conf / (1 - conf));
     int R = m->reg_max;
     int total = 0;
@@ -910,6 +913,9 @@ int yseg_objects(YSeg *m, float conf, float iou_max, unsigned char *mask, int ma
             d->y2 = (cy + dist[3]) * s;
             d->coef = mc->d + i;
             d->cstride = N;
+            d->gx = i % W;
+            d->gy = i / W;
+            d->stride = s;
         }
     }
     qsort(dets, nd, sizeof(Det), by_score);
@@ -924,6 +930,15 @@ int yseg_objects(YSeg *m, float conf, float iou_max, unsigned char *mask, int ma
         }
         if (ok) dets[kept++] = dets[i];
     }
+    *out = dets;
+    return kept;
+}
+
+int yseg_objects(YSeg *m, float conf, float iou_max, unsigned char *mask, int max_people, const unsigned char *classes) {
+    if (m->nout != 10) return -1;
+    Det *dets;
+    int kept = detect(m, conf, iou_max, max_people, classes, &dets);
+    if (kept < 0) return -1;
 
     /* Each person's mask logits at the proto resolution (a quarter of the input), upsampled
      * bilinearly to the input size, cropped to the person's box there, then combined. */
@@ -999,6 +1014,31 @@ int yseg_objects(YSeg *m, float conf, float iou_max, unsigned char *mask, int ma
         }
     }
     free(logit);
+    free(dets);
+    return kept;
+}
+
+int yseg_pose(YSeg *m, float conf, float iou_max, float *out, int max) {
+    if (m->nout != 9) return -1;
+    Det *dets;
+    int kept = detect(m, conf, iou_max, max, NULL, &dets);
+    if (kept < 0) return -1;
+    for (int k = 0; k < kept; k++) {
+        Det *d = &dets[k];
+        float *o = out + 56 * k;
+        o[0] = d->x1;
+        o[1] = d->y1;
+        o[2] = d->x2;
+        o[3] = d->y2;
+        o[4] = d->score;
+        for (int j = 0; j < 17; j++) {
+            float rx = d->coef[(size_t) (3 * j) * d->cstride], ry = d->coef[(size_t) (3 * j + 1) * d->cstride];
+            float rv = d->coef[(size_t) (3 * j + 2) * d->cstride];
+            o[5 + 3 * j] = (rx * 2 + d->gx) * d->stride;
+            o[6 + 3 * j] = (ry * 2 + d->gy) * d->stride;
+            o[7 + 3 * j] = 1.0f / (1.0f + expf(-rv));
+        }
+    }
     free(dets);
     return kept;
 }

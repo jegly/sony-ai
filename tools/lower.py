@@ -13,7 +13,8 @@ Ops (tensors are float CHW, batch 1; tensor 0 is the RGB input, 0..1):
   ATTN    qkv out v heads key_dim head_dim            (YOLO11 PSA attention, see Attention.forward)
 
 Outputs, in order: for each of the three scales, box (64 ch, DFL), class logits (80 COCO classes, or
-only "person" with --person-only), mask coefficients (32 ch); then the mask protos.
+only "person" with --person-only), mask coefficients (32 ch); then the mask protos. For a pose model
+(yolo11n-pose) the third output of each scale is the 51 keypoint values, and there are no protos.
 """
 import struct
 import sys
@@ -175,6 +176,12 @@ class Graph:
                 x = self.up2(src[0])
             elif name == "Concat":
                 x = self.concat(src)
+            elif name == "Pose":
+                # per scale: box (DFL), class logits, keypoints (17 x (x, y, visibility), raw)
+                for lvl, f in enumerate(src):
+                    outs.append(self.seq_conv(f, m.cv2[lvl]))
+                    outs.append(self.seq_conv(f, m.cv3[lvl], CLASSES))
+                    outs.append(self.seq_conv(f, m.cv4[lvl]))
             elif name == "Segment":
                 for lvl, f in enumerate(src):
                     outs.append(self.seq_conv(f, m.cv2[lvl]))
@@ -266,7 +273,8 @@ def main():
             want = []
             for lvl in range(3):
                 want += [head.cv2[lvl](feats[lvl]), head.cv3[lvl](feats[lvl])[:, CLASSES], head.cv4[lvl](feats[lvl])]
-            want.append(head.proto(feats[0]))
+            if hasattr(head, "proto"):
+                want.append(head.proto(feats[0]))
             for half in (False, True):
                 got = run_ref(g, x, half)
                 errs = [float((a - b).abs().max()) for a, b in zip(got, want)]

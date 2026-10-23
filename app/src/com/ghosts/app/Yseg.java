@@ -40,6 +40,12 @@ public class Yseg {
         return out;
     }
 
+    /** Runs a pose model: 56 floats per person (x1 y1 x2 y2 score, then 17 x (x, y, visibility)), model pixels. */
+    public float[] pose(byte[] rgb, int w, int h, float conf) throws IOException {
+        if (handle == 0) throw new IOException("model was freed");
+        return nativePose(handle, rgb, w, h, conf);
+    }
+
     public void free() {
         if (handle != 0) nativeFree(handle);
         handle = 0;
@@ -50,6 +56,8 @@ public class Yseg {
     private static native void nativeFree(int handle);
 
     private static native float[] nativeBoxes(int handle);
+
+    private static native float[] nativePose(int handle, byte[] rgb, int w, int h, float conf) throws IOException;
 
     private static native int nativeRunRaw(int handle, byte[] rgb, int w, int h, float[] out) throws IOException;
 

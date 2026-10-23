@@ -81,10 +81,10 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     private static final String[] TARGET_NAMES = {"People", "Vehicles", "Animals", "People + animals", "Everything"};
     private static final int[] VEHICLES = {1, 2, 3, 4, 5, 6, 7, 8}, ANIMALS = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
     private static final String[] PEOPLE_NAMES = {"Off", "Ghosts", "Wireframe", "Contours", "Face mesh", "Points", "Colour pop",
-            "Bokeh", "Spotlight", "Glitch", "Thermal", "Halftone"};
+            "Bokeh", "Spotlight", "Glitch", "Thermal", "Halftone", "Skeleton"};
     private static final String[] PEOPLE_NOTES = {"", "", "triangle mesh, face mesh on faces", "scan lines", "faces only, quicker",
             "point cloud", "the rest in black and white", "background out of focus", "background in darkness", "digital break-up",
-            "heat camera", "printed dots"};
+            "heat camera", "printed dots", "neon stick figures"};
     private static final int[] MODEL_SIZES = {320, 480, 640};
     private static final String[] MODEL_NAMES = {"Fast", "Normal", "Fine"};
     private static final String[] MODEL_NOTES = {"320 px, finds fewer people", "480 px", "640 px, slowest, finds the most people"};

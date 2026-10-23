@@ -63,7 +63,7 @@ public class Ghoster {
 
     public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3, PEOPLE_FACES = 4,
             PEOPLE_POINTS = 5, PEOPLE_COLOUR_POP = 6, PEOPLE_BOKEH = 7, PEOPLE_SPOTLIGHT = 8, PEOPLE_GLITCH = 9, PEOPLE_THERMAL = 10,
-            PEOPLE_HALFTONE = 11;
+            PEOPLE_HALFTONE = 11, PEOPLE_SKELETON = 12;
     /** Effects done by Scene, in Scene's order from PEOPLE_COLOUR_POP. */
     private static final int SCENE_FIRST = PEOPLE_COLOUR_POP, SCENE_LAST = PEOPLE_HALFTONE;
     private static final String MODEL = "yolo11n-seg.bin";
@@ -119,7 +119,7 @@ public class Ghoster {
 
     /** Runs on the worker thread; the model belongs to this run, so a later worker never shares it. */
     private void loop() {
-        Yseg[] model = new Yseg[3]; // people, face detector, face landmarks
+        Yseg[] model = new Yseg[4]; // people, face detector, face landmarks, pose
         try {
             while (true) {
                 File next;
@@ -228,7 +228,7 @@ public class Ghoster {
             sb.append(mw).append('x').append(mh);
             byte[] mask = null;
             int people = -1;
-            if (opt.people != PEOPLE_OFF && opt.people != PEOPLE_FACES) {
+            if (opt.people != PEOPLE_OFF && opt.people != PEOPLE_FACES && opt.people != PEOPLE_SKELETON) {
                 stage("Finding people");
                 long tl = System.currentTimeMillis();
                 if (model[0] == null) model[0] = new Yseg(assets, MODEL);
@@ -247,6 +247,29 @@ public class Ghoster {
             rgb = null;
             sb.append(", decode ").append(t1 - t0).append(" ms, shrink ").append(t2 - t1).append(" ms");
             peopleOut[0] = people;
+            Skeleton skeletonV = null;
+            if (opt.people == PEOPLE_SKELETON) {
+                stage("Finding poses");
+                long tp = System.currentTimeMillis();
+                if (model[3] == null) model[3] = new Yseg(assets, "yolo11n-pose.bin");
+                float[] poses = model[3].pose(rgb, mw, mh, 0.3f);
+                skeletonV = new Skeleton(opt.opacity, opt.glow, Ghost.tint(opt.colour));
+                float aspect = sideways ? (float) mh / mw : (float) mw / mh; // the copy's width / height
+                for (int p = 0; p + 55 < poses.length; p += 56) {
+                    float[] kp = new float[51];
+                    for (int k = 0; k < 17; k++) {
+                        float[] f = uprightToFileFraction(poses[p + 5 + 3 * k] / mw, poses[p + 6 + 3 * k] / mh, deg);
+                        kp[3 * k] = f[0];
+                        kp[3 * k + 1] = f[1];
+                        kp[3 * k + 2] = poses[p + 7 + 3 * k];
+                    }
+                    // the person's size as a fraction of the copy's height
+                    float size = sideways ? (poses[p + 3] - poses[p + 1]) / mh * ((float) mh / mw) : (poses[p + 3] - poses[p + 1]) / mh;
+                    skeletonV.addPerson(kp, size, aspect);
+                }
+                people = skeletonV.people();
+                sb.append(", pose ").append(System.currentTimeMillis() - tp).append(" ms");
+            }
             Mesh faceOnly = null;
             if (opt.people == PEOPLE_FACES) {
                 // faces only: no people model, the face detector scans the whole frame
@@ -303,12 +326,14 @@ public class Ghoster {
             final Wireframe wire = wireV;
             final Mesh mesh = meshV;
             final Scene scene = sceneV;
+            final Skeleton skeleton = skeletonV;
             final Diffusion diffusion;
             if (opt.diffusion > 0) {
                 // the filter sits in front of the lens, so the ghosts' own light gets diffused too
                 int[] lit = ppx;
-                if (ghost != null || wire != null || mesh != null || scene != null) {
+                if (ghost != null || wire != null || mesh != null || scene != null || skeleton != null) {
                     lit = ppx.clone();
+                    if (skeleton != null) skeleton.apply(lit, 0, qh, qw, qh);
                     if (scene != null) scene.apply(lit, 0, qh, qw, qh);
                     if (ghost != null) ghost.apply(lit, 0, qh, qw, qh);
                     if (wire != null) wire.apply(lit, 0, qh, qw, qh);
@@ -321,6 +346,7 @@ public class Ghoster {
             Effect effect = new Effect() {
                 public void apply(int[] rows, int y, int count, int w, int h) {
                     if (scene != null) scene.apply(rows, y, count, w, h);
+                    if (skeleton != null) skeleton.apply(rows, y, count, w, h);
                     if (ghost != null) ghost.apply(rows, y, count, w, h);
                     if (wire != null) wire.apply(rows, y, count, w, h);
                     if (mesh != null) mesh.apply(rows, y, count, w, h);
@@ -444,6 +470,16 @@ public class Ghoster {
         for (int k = 0; k < pts.length; k++) pts[k] *= toMask;
         mesh.addFace(pts, faceMesh, style);
         return true;
+    }
+
+    /** A point of the upright image, as fractions of its width and height, in the file's own orientation. */
+    private static float[] uprightToFileFraction(float x, float y, int deg) {
+        switch (deg) {
+            case 90: return new float[] {y, 1 - x};
+            case 180: return new float[] {1 - x, 1 - y};
+            case 270: return new float[] {1 - y, x};
+            default: return new float[] {x, y};
+        }
     }
 
     /** Maps upright copy coordinates to the file's own orientation (continuous pixel coordinates). */
