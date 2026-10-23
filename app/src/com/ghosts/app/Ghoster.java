@@ -41,9 +41,17 @@ public class Ghoster {
         public int modelSize = 480;
         /** Glow level, see Ghost.GLOW. */
         public int glow = 2;
+        /** Ghost.SOLID, ETHEREAL or DREAMY. */
+        public int look = Ghost.ETHEREAL;
+        /** How solid the figures are, 0..1. */
+        public float opacity = 0.85f;
+        /** Find people and ghost them (otherwise only the diffusion filter is applied). */
+        public boolean ghosts = true;
+        /** Diffusion filter setting, see Diffusion.NAMES (0 = off). */
+        public int diffusion = 0;
         /** Copy size as a fraction of the photo: 2 = half (Large), 4 = quarter (Small). */
         public int sample = 4;
-        public int threads = 4;
+        public int threads = 1;
         public float confidence = 0.2f;
     }
 
@@ -138,12 +146,20 @@ public class Ghoster {
         listener.onStatus(pending(), s);
     }
 
-    /** Makes the ghost copy of src; returns it, or null when no one was found (nothing is written). */
+    /** One effect applied to strips of the copy. */
+    private interface Effect {
+        void apply(int[] rgb, int y, int count, int w, int h);
+    }
+
+    /**
+     * Makes the copy of src; returns it, or null when it would be unchanged (ghosts only, and no one was
+     * found). peopleOut gets the number of people, or -1 when people weren't looked for.
+     */
     private File ghost(File src, Options opt, int[] peopleOut, Yseg[] model) throws IOException {
         waitUntilStable(src);
         long t0 = System.currentTimeMillis();
 
-        // 1. a small upright copy for the model
+        // 1. the photo: decoded once at copy size when it fits in memory, and shrunk upright for the model
         int orientation = ExifInterface.ORIENTATION_NORMAL;
         try {
             orientation = new ExifInterface(src.getPath()).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
@@ -167,110 +183,148 @@ public class Ghoster {
             mh = opt.modelSize;
             mw = round32((float) opt.modelSize * dispW / dispH);
         }
-        BitmapFactory.Options o = new BitmapFactory.Options();
-        o.inSampleSize = 1;
-        while (Math.max(pw, ph) / (o.inSampleSize * 2) >= Math.max(mw, mh)) o.inSampleSize *= 2;
-        Bitmap b = BitmapFactory.decodeFile(src.getPath(), o);
-        if (b == null) throw new IOException("cannot decode " + src.getName());
-        Matrix m = new Matrix();
-        if (deg != 0) m.postRotate(deg);
-        float rw = sideways ? b.getHeight() : b.getWidth(), rh = sideways ? b.getWidth() : b.getHeight();
-        m.postScale(mw / rw, mh / rh);
-        Bitmap small = Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
-        if (small != b) b.recycle();
-        int[] px = new int[mw * mh];
-        small.getPixels(px, 0, mw, 0, 0, Math.min(mw, small.getWidth()), Math.min(mh, small.getHeight()));
-        small.recycle();
-        byte[] rgb = new byte[mw * mh * 3];
-        for (int i = 0; i < px.length; i++) {
-            rgb[i * 3] = (byte) (px[i] >> 16);
-            rgb[i * 3 + 1] = (byte) (px[i] >> 8);
-            rgb[i * 3 + 2] = (byte) px[i];
-        }
-        px = null;
+        Bitmap full = decodeCopy(src, pw, ph, opt.sample);
         long t1 = System.currentTimeMillis();
-        if (cancelled) throw new IOException("cancelled");
-
-        // 2. find the people
-        stage("Finding people");
-        long tl = System.currentTimeMillis();
-        if (model[0] == null) model[0] = new Yseg(assets, MODEL);
-        long loadMs = System.currentTimeMillis() - tl;
-        byte[] mask = new byte[mw * mh];
-        double[] times = new double[9];
-        int people = model[0].run(rgb, mw, mh, opt.threads, opt.confidence, mask, times);
-        rgb = null;
-        long t2 = System.currentTimeMillis();
-        peopleOut[0] = people;
-        StringBuilder sb = new StringBuilder();
-        sb.append(mw).append('x').append(mh).append(" model ").append(t2 - tl - loadMs).append(" ms (")
-                .append(opt.threads).append(" threads");
-        for (int i = 1; i < times.length; i++) {
-            if (times[i] >= 1) sb.append(", ").append(Yseg.OP_NAMES[i]).append(' ').append(Math.round(times[i]));
+        Bitmap b = full;
+        if (b == null) {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inSampleSize = 1;
+            while (Math.max(pw, ph) / (o.inSampleSize * 2) >= Math.max(mw, mh)) o.inSampleSize *= 2;
+            b = BitmapFactory.decodeFile(src.getPath(), o);
+            if (b == null) throw new IOException("cannot decode " + src.getName());
         }
-        sb.append("), load ").append(loadMs).append(" ms, prepare ").append(t1 - t0).append(" ms");
-        if (people == 0) {
-            lastTiming = sb.toString();
-            return null;
-        }
-        if (cancelled) throw new IOException("cancelled");
-
-        // 3. the mask back in the file's own pixel orientation, then the copy
-        int qw = sideways ? mh : mw, qh = sideways ? mw : mh;
-        byte[] pmask = unrotate(mask, mw, mh, deg);
-        Ghost ghost = new Ghost(pmask, qw, qh, opt.glow);
-        stage("Saving copy");
-        outDir.mkdirs();
-        File tmp = new File(outDir, outName(src.getName()) + ".TMP");
-        File done = new File(outDir, outName(src.getName()) + ".JPG");
-        byte[] exif = null;
         try {
-            exif = Jpeg.readExif(new FileInputStream(src));
-        } catch (IOException ignored) {
-        }
-        boolean ok = false;
-        String how;
-        try {
-            how = writeNative(src, tmp, opt.sample, ghost, exif);
-            if (how == null) how = writeStreaming(src, tmp, opt.sample, ghost, exif);
-            ok = true;
+            Matrix m = new Matrix();
+            if (deg != 0) m.postRotate(deg);
+            float rw = sideways ? b.getHeight() : b.getWidth(), rh = sideways ? b.getWidth() : b.getHeight();
+            m.postScale(mw / rw, mh / rh);
+            Bitmap small = Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
+            if (b != full) b.recycle();
+            int[] px = new int[mw * mh];
+            small.getPixels(px, 0, mw, 0, 0, Math.min(mw, small.getWidth()), Math.min(mh, small.getHeight()));
+            small.recycle();
+            byte[] rgb = new byte[mw * mh * 3];
+            for (int i = 0; i < px.length; i++) {
+                rgb[i * 3] = (byte) (px[i] >> 16);
+                rgb[i * 3 + 1] = (byte) (px[i] >> 8);
+                rgb[i * 3 + 2] = (byte) px[i];
+            }
+            long t2 = System.currentTimeMillis();
+            if (cancelled) throw new IOException("cancelled");
+
+            // 2. find the people
+            StringBuilder sb = new StringBuilder();
+            sb.append(mw).append('x').append(mh);
+            byte[] mask = null;
+            int people = -1;
+            if (opt.ghosts) {
+                stage("Finding people");
+                long tl = System.currentTimeMillis();
+                if (model[0] == null) model[0] = new Yseg(assets, MODEL);
+                long loadMs = System.currentTimeMillis() - tl;
+                mask = new byte[mw * mh];
+                double[] times = new double[9];
+                people = model[0].run(rgb, mw, mh, opt.threads, opt.confidence, mask, times);
+                long t3 = System.currentTimeMillis();
+                sb.append(" model ").append(t3 - tl - loadMs).append(" ms (").append(opt.threads)
+                        .append(opt.threads == 1 ? " thread" : " threads");
+                for (int i = 1; i < times.length; i++) {
+                    if (times[i] >= 1) sb.append(", ").append(Yseg.OP_NAMES[i]).append(' ').append(Math.round(times[i]));
+                }
+                sb.append("), load ").append(loadMs).append(" ms");
+            }
+            rgb = null;
+            sb.append(", decode ").append(t1 - t0).append(" ms, shrink ").append(t2 - t1).append(" ms");
+            peopleOut[0] = people;
+            if (people == 0 && opt.diffusion == 0) {
+                lastTiming = sb.toString();
+                return null;
+            }
+            if (cancelled) throw new IOException("cancelled");
+
+            // 3. the mask and the small photo back in the file's own pixel orientation, then the copy
+            int qw = sideways ? mh : mw, qh = sideways ? mw : mh;
+            int[] index = uprightIndex(mw, mh, deg);
+            int[] ppx = new int[px.length];
+            for (int i = 0; i < index.length; i++) ppx[i] = px[index[i]];
+            final Ghost ghost;
+            if (people > 0) {
+                byte[] pmask = new byte[mask.length];
+                for (int i = 0; i < index.length; i++) pmask[i] = mask[index[i]];
+                ghost = new Ghost(pmask, qw, qh, opt.glow, opt.look, opt.opacity, ppx);
+            } else {
+                ghost = null;
+            }
+            final Diffusion diffusion;
+            if (opt.diffusion > 0) {
+                // the filter sits in front of the lens, so the ghosts' own light gets diffused too
+                int[] lit = ppx;
+                if (ghost != null) {
+                    lit = ppx.clone();
+                    ghost.apply(lit, 0, qh, qw, qh);
+                }
+                diffusion = new Diffusion(lit, qw, qh, opt.diffusion);
+            } else {
+                diffusion = null;
+            }
+            Effect effect = new Effect() {
+                public void apply(int[] rows, int y, int count, int w, int h) {
+                    if (ghost != null) ghost.apply(rows, y, count, w, h);
+                    if (diffusion != null) diffusion.apply(rows, y, count, w, h);
+                }
+            };
+            stage("Saving copy");
+            outDir.mkdirs();
+            File tmp = new File(outDir, outName(src.getName()) + ".TMP");
+            File done = new File(outDir, outName(src.getName()) + ".JPG");
+            byte[] exif = null;
+            try {
+                exif = Jpeg.readExif(new FileInputStream(src));
+            } catch (IOException ignored) {
+            }
+            boolean ok = false;
+            String how;
+            try {
+                how = full != null ? writeBitmap(full, tmp, effect, exif) : writeStreaming(src, tmp, opt.sample, effect, exif);
+                ok = true;
+            } finally {
+                if (!ok) tmp.delete();
+            }
+            done.delete();
+            if (!tmp.renameTo(done)) throw new IOException("could not rename " + tmp.getName());
+            lastTiming = sb + ", " + how + (ghost != null ? String.format(", %.0f%% of frame", ghost.coverage() * 100) : "")
+                    + (diffusion != null ? ", " + Diffusion.NAMES[opt.diffusion] : "");
+            return done;
         } finally {
-            if (!ok) tmp.delete();
+            if (full != null) full.recycle();
         }
-        done.delete();
-        if (!tmp.renameTo(done)) throw new IOException("could not rename " + tmp.getName());
-        lastTiming = sb + ", " + how + String.format(", %.0f%% of frame", ghost.coverage() * 100);
-        return done;
     }
 
     private static int round32(float v) {
         return Math.max(32, Math.round(v / 32f) * 32);
     }
 
-    /** The mask of the upright photo (w x h) turned back to the file's pixel orientation. */
-    private static byte[] unrotate(byte[] d, int w, int h, int deg) {
-        if (deg == 0) return d;
-        byte[] out = new byte[w * h];
-        if (deg == 180) {
-            for (int i = 0; i < w * h; i++) out[i] = d[w * h - 1 - i];
-            return out;
-        }
-        // the file is h wide and w tall; deg is how far it was turned to stand upright
-        int fw = h, fh = w;
-        for (int y = 0; y < fh; y++) {
-            for (int x = 0; x < fw; x++) {
-                int ux, uy; // where (x, y) landed in the upright image
-                if (deg == 90) {
-                    ux = fh - 1 - y;
-                    uy = x;
-                } else {
-                    ux = y;
-                    uy = fw - 1 - x;
+    /**
+     * For each pixel of the file's own orientation, its index in the upright image (w x h) that the model saw.
+     * deg is how far the file was turned to stand upright.
+     */
+    private static int[] uprightIndex(int w, int h, int deg) {
+        int[] idx = new int[w * h];
+        if (deg == 0) {
+            for (int i = 0; i < idx.length; i++) idx[i] = i;
+        } else if (deg == 180) {
+            for (int i = 0; i < idx.length; i++) idx[i] = w * h - 1 - i;
+        } else {
+            int fw = h, fh = w; // the file is turned on its side
+            for (int y = 0; y < fh; y++) {
+                for (int x = 0; x < fw; x++) {
+                    int ux = deg == 90 ? fh - 1 - y : y;
+                    int uy = deg == 90 ? x : fw - 1 - x;
+                    idx[y * fw + x] = uy * w + ux;
                 }
-                out[y * fw + x] = d[uy * w + ux];
             }
         }
-        return out;
+        return idx;
     }
 
     private boolean waitForCard() {
@@ -285,18 +339,14 @@ public class Ghoster {
     }
 
     /**
-     * Fast path: the camera's native decoder and encoder with the whole copy in one bitmap.
-     * Returns null (and leaves nothing behind) when there isn't enough memory, so the caller streams instead.
+     * The photo at copy size as one editable bitmap, using the camera's native decoder. Returns null when
+     * there isn't enough memory, so the copy is streamed instead.
      */
-    private String writeNative(File src, File tmp, int sample, Ghost ghost, byte[] exif) throws IOException {
-        BitmapFactory.Options bounds = new BitmapFactory.Options();
-        bounds.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(src.getPath(), bounds);
-        long bytes = (long) (bounds.outWidth / sample) * (bounds.outHeight / sample) * 4;
+    private static Bitmap decodeCopy(File src, int pw, int ph, int sample) {
+        long bytes = (long) (pw / sample) * (ph / sample) * 4;
         Runtime rt = Runtime.getRuntime();
         long free = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory());
         if (free < bytes * 2 + 4 * MB) return null;
-        long t0 = System.currentTimeMillis();
         BitmapFactory.Options o = new BitmapFactory.Options();
         o.inSampleSize = sample;
         Bitmap decoded = null;
@@ -306,6 +356,8 @@ public class Ghoster {
             region = BitmapRegionDecoder.newInstance(src.getPath(), false);
             if (region != null) decoded = region.decodeRegion(new Rect(0, 0, region.getWidth(), region.getHeight()), o);
         } catch (OutOfMemoryError e) {
+            decoded = null;
+        } catch (IOException e) {
             decoded = null;
         } finally {
             if (region != null) region.recycle();
@@ -317,51 +369,47 @@ public class Ghoster {
                 decoded = null;
             }
         }
-        if (decoded == null) return null;
-        Bitmap full;
-        if (decoded.isMutable()) {
-            full = decoded;
-        } else {
-            try {
-                full = decoded.copy(Bitmap.Config.ARGB_8888, true);
-            } catch (OutOfMemoryError e) {
-                full = null;
-            }
-            decoded.recycle();
-            if (full == null) return null;
-        }
+        if (decoded == null || decoded.isMutable()) return decoded;
+        Bitmap copy;
         try {
-            long t1 = System.currentTimeMillis();
-            int w = full.getWidth(), h = full.getHeight();
-            int[] rows = new int[w * STRIP];
-            for (int y = 0; y < h; y += STRIP) {
-                if (cancelled) throw new IOException("cancelled");
-                int n = Math.min(STRIP, h - y);
-                full.getPixels(rows, 0, w, 0, y, w, n);
-                ghost.apply(rows, y, n, w, h);
-                full.setPixels(rows, 0, w, 0, y, w, n);
-            }
-            long t2 = System.currentTimeMillis();
-            if (!waitForCard()) throw new IOException("cancelled");
-            OutputStream os = new BufferedOutputStream(new FileOutputStream(tmp), 64 * 1024);
-            try {
-                // the camera's encoder writes its own start marker; put the original Exif right after ours
-                os.write(0xFF);
-                os.write(0xD8);
-                if (exif != null) os.write(exif);
-                full.compress(Bitmap.CompressFormat.JPEG, 92, new SkipStart(os));
-            } finally {
-                os.close();
-            }
-            long t3 = System.currentTimeMillis();
-            return w + "x" + h + " native: decode " + (t1 - t0) + " ms, ghost " + (t2 - t1) + " ms, encode " + (t3 - t2) + " ms";
-        } finally {
-            full.recycle();
+            copy = decoded.copy(Bitmap.Config.ARGB_8888, true);
+        } catch (OutOfMemoryError e) {
+            copy = null;
         }
+        decoded.recycle();
+        return copy;
+    }
+
+    /** Fast path: ghosts the decoded copy in place and saves it with the camera's native encoder. */
+    private String writeBitmap(Bitmap full, File tmp, Effect effect, byte[] exif) throws IOException {
+        long t1 = System.currentTimeMillis();
+        int w = full.getWidth(), h = full.getHeight();
+        int[] rows = new int[w * STRIP];
+        for (int y = 0; y < h; y += STRIP) {
+            if (cancelled) throw new IOException("cancelled");
+            int n = Math.min(STRIP, h - y);
+            full.getPixels(rows, 0, w, 0, y, w, n);
+            effect.apply(rows, y, n, w, h);
+            full.setPixels(rows, 0, w, 0, y, w, n);
+        }
+        long t2 = System.currentTimeMillis();
+        if (!waitForCard()) throw new IOException("cancelled");
+        OutputStream os = new BufferedOutputStream(new FileOutputStream(tmp), 64 * 1024);
+        try {
+            // the camera's encoder writes its own start marker; put the original Exif right after ours
+            os.write(0xFF);
+            os.write(0xD8);
+            if (exif != null) os.write(exif);
+            full.compress(Bitmap.CompressFormat.JPEG, 92, new SkipStart(os));
+        } finally {
+            os.close();
+        }
+        long t3 = System.currentTimeMillis();
+        return w + "x" + h + " native: ghost " + (t2 - t1) + " ms, encode " + (t3 - t2) + " ms";
     }
 
     /** Low-memory path: decodes and encodes in strips so the copy never has to fit in memory at once. */
-    private String writeStreaming(File src, File tmp, int sample, Ghost ghost, byte[] exif) throws IOException {
+    private String writeStreaming(File src, File tmp, int sample, Effect effect, byte[] exif) throws IOException {
         BitmapRegionDecoder decoder = BitmapRegionDecoder.newInstance(src.getPath(), false);
         if (decoder == null) throw new IOException("cannot decode " + src.getName());
         int fullW = decoder.getWidth(), fullH = decoder.getHeight();
@@ -384,7 +432,7 @@ public class Ghoster {
                     for (int x = bw; x < w; x++) rows[row * w + x] = rows[row * w + bw - 1];
                 }
                 b.recycle();
-                ghost.apply(rows, y, count, w, h);
+                effect.apply(rows, y, count, w, h);
                 jw.writeRows(rows, count);
             }
             jw.finish();

@@ -44,10 +44,11 @@ import java.util.List;
 
 /**
  * Ghosts: after each shot, finds the people in the photo (YOLO11n-seg, run on the camera's own CPU) and
- * saves a copy in GHOSTS with them turned into glowing white figures.
+ * saves a copy in GHOSTS with them turned into glowing white figures. It can also (or instead) add a
+ * diffusion filter look, like a Black Pro-Mist.
  *
  * Controls (A7 II): rear dial = shutter (S/M) or exposure comp (P/A), front dial = ISO, Fn = menu
- * (model size, glow, copy size, CPU cores, white balance, Kelvin, D-Range: up/down picks a row, left/right or
+ * (mode, diffusion, model size, look, opacity, glow, copy size, white balance, Kelvin, D-Range: up/down picks a row, left/right or
  * the wheel changes it), centre = focus magnifier, C3 = white balance, DISP/up = info on/off,
  * Play = review photos (C1: ghost copy or original, C2: ghost this photo), MENU = exit.
  */
@@ -71,19 +72,28 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     private boolean overlay = true;
 
     // Fn menu: one row per setting
-    private static final String[] MENU_ROWS = {"Model", "Glow", "Copy size", "CPU", "WB", "Kelvin", "D-Range"};
-    private static final int ROW_MODEL = 0, ROW_GLOW = 1, ROW_SIZE = 2, ROW_CPU = 3, ROW_WB = 4, ROW_KELVIN = 5, ROW_DRO = 6;
+    private static final String[] MENU_ROWS = {"Mode", "Diffusion", "Model", "Look", "Opacity", "Glow", "Copy size", "WB",
+            "Kelvin", "D-Range"};
+    private static final int ROW_MODE = 0, ROW_DIFFUSION = 1, ROW_MODEL = 2, ROW_LOOK = 3, ROW_OPACITY = 4, ROW_GLOW = 5,
+            ROW_SIZE = 6, ROW_WB = 7, ROW_KELVIN = 8, ROW_DRO = 9;
+    private static final String[] MODE_NAMES = {"Ghosts", "Diffusion", "Ghosts + diffusion"};
+    private static final int MODE_GHOSTS = 0, MODE_DIFFUSION = 1, MODE_BOTH = 2;
     private static final int[] MODEL_SIZES = {320, 480, 640};
     private static final String[] MODEL_NAMES = {"Fast", "Normal", "Fine"};
     private static final String[] MODEL_NOTES = {"320 px, finds fewer people", "480 px", "640 px, slowest, finds the most people"};
     private static final String[] GLOW_NAMES = {"Off", "Soft", "Strong"};
-    private static final int[] CPU_CHOICES = {1, 2, 4};
+    private static final int[] OPACITIES = {100, 85, 70, 50, 30};
+    private static final String[] LOOK_NOTES = {"opaque white", "feathered, halo of light", "ethereal in a hazy, softer scene"};
     private boolean menuOpen;
-    private int menuRow = ROW_MODEL;
+    private int menuRow = ROW_MODE;
     private int model = 1;
     private int glow = 2;
     private boolean largeCopy;
-    private int cpu = 2;
+    private int mode = MODE_GHOSTS;
+    /** Diffusion setting, 1.. (Diffusion.NAMES; 0 "Off" isn't offered, Mode turns it off). */
+    private int diffusion = 6;
+    private int look = Ghost.ETHEREAL;
+    private int opacity = 1;
     // Sony's D-Range Optimizer: 0 off, 1 auto, 2.. level 1..maxDro
     private int dro;
     private int maxDro = 5;
@@ -182,10 +192,13 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             public void onDone(final String source, final File result, final int people, final long millis) {
                 runOnUiThread(new Runnable() {
                     public void run() {
-                        log((result == null ? "no people in " + source : "ghosted " + source + " -> " + result.getName())
+                        log((result == null ? "no people in " + source : "copied " + source + " -> " + result.getName())
                                 + ", " + people + " people, " + millis + " ms: " + ghoster.lastTiming);
                         if (result == null) {
                             showMessage("No people found in " + source);
+                        } else if (people <= 0) {
+                            showMessage((people == 0 ? "No people, diffused copy saved: " : "Diffused copy saved: ")
+                                    + result.getName() + " (" + (millis / 1000) + " s)");
                         } else {
                             showMessage(people + (people == 1 ? " ghost" : " ghosts") + " saved: " + result.getName()
                                     + " (" + (millis / 1000) + " s)");
@@ -390,6 +403,14 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     /** Left/right or the wheel: change the value on the highlighted row. */
     private void menuChange(int dir) {
         switch (menuRow) {
+            case ROW_MODE:
+                mode = (mode + dir + MODE_NAMES.length) % MODE_NAMES.length;
+                break;
+            case ROW_DIFFUSION: {
+                int n = Diffusion.NAMES.length - 1;
+                diffusion = (diffusion - 1 + dir + n) % n + 1;
+                break;
+            }
             case ROW_MODEL:
                 model = (model + dir + MODEL_SIZES.length) % MODEL_SIZES.length;
                 break;
@@ -399,8 +420,11 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             case ROW_SIZE:
                 largeCopy = !largeCopy;
                 break;
-            case ROW_CPU:
-                cpu = (cpu + dir + CPU_CHOICES.length) % CPU_CHOICES.length;
+            case ROW_LOOK:
+                look = (look + dir + Ghost.LOOKS.length) % Ghost.LOOKS.length;
+                break;
+            case ROW_OPACITY:
+                opacity = (opacity + dir + OPACITIES.length) % OPACITIES.length;
                 break;
             case ROW_WB:
                 if (!wbModes.isEmpty()) {
@@ -428,11 +452,15 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         if (!menuOpen && pickerPanel.getVisibility() != View.GONE) repaintSoon();
         pickerPanel.setVisibility(menuOpen ? View.VISIBLE : View.GONE);
         if (!menuOpen) return;
+        boolean ghostsOn = mode != MODE_DIFFUSION, diffusionOn = mode != MODE_GHOSTS;
         String[] values = {
+            MODE_NAMES[mode] + (mode == MODE_DIFFUSION ? "  (no AI, quick)" : ""),
+            Diffusion.NAMES[diffusion] + (diffusionOn ? "" : "  (Mode is Ghosts)"),
             MODEL_NAMES[model] + "  (" + MODEL_NOTES[model] + ")",
+            Ghost.LOOKS[look] + "  (" + LOOK_NOTES[look] + ")",
+            OPACITIES[opacity] + "%" + (opacity == 0 ? "  (pure white)" : ""),
             GLOW_NAMES[glow],
             largeCopy ? "Large  (3000 px, slower to save)" : "Small  (1500 px)",
-            CPU_CHOICES[cpu] + (CPU_CHOICES[cpu] == 1 ? " core" : " cores"),
             wbModes.isEmpty() ? "n/a" : wbLabel(wbMode, kelvin),
             kelvin + "K" + (WB_KELVIN.equals(wbMode) ? "" : "  (sets WB)"),
             droLabel(),
@@ -445,7 +473,8 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             sb.append(i == menuRow ? "<  " + values[i] + "  >" : "   " + values[i]).append('\n');
         }
         sb.append("\nup/down: row   left/right: change   Fn: close");
-        if (menuRow <= ROW_CPU) sb.append("\nEach shot gets a ghost copy in GHOSTS (needs JPEG)");
+        if (menuRow >= ROW_MODEL && menuRow <= ROW_GLOW && !ghostsOn) sb.append("\n(only used when Mode includes Ghosts)");
+        else if (menuRow <= ROW_SIZE) sb.append("\nEach shot gets a copy in GHOSTS (needs JPEG)");
         picker.setText(sb.toString());
     }
 
@@ -747,7 +776,10 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         opt.modelSize = MODEL_SIZES[model];
         opt.glow = glow;
         opt.sample = largeCopy ? 2 : 4;
-        opt.threads = CPU_CHOICES[cpu];
+        opt.ghosts = mode != MODE_DIFFUSION;
+        opt.diffusion = mode == MODE_GHOSTS ? 0 : diffusion;
+        opt.look = look;
+        opt.opacity = OPACITIES[opacity] / 100f;
         return opt;
     }
 
@@ -934,7 +966,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             return;
         }
         ghoster.add(f, options());
-        showMessage("Ghosting " + f.getName() + "... (" + MODEL_NAMES[model] + ")");
+        showMessage((mode == MODE_DIFFUSION ? "Diffusing " : "Ghosting ") + f.getName() + "...");
     }
 
     /** dir 1 = older photo, -1 = newer. */
@@ -1265,7 +1297,10 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         }
         topBar.setVisibility(overlay || queued > 0 ? View.VISIBLE : View.GONE);
         String status = queued > 0 ? (stage.length() > 0 ? stage : "Waiting") + (queued > 1 ? " (" + queued + " queued)" : "") + "...    " : "";
-        topBar.setText(status + "GHOSTS   " + MODEL_NAMES[model] + "   Glow " + GLOW_NAMES[glow].toLowerCase()
+        String what = mode == MODE_DIFFUSION ? Diffusion.NAMES[diffusion]
+                : Ghost.LOOKS[look] + " " + OPACITIES[opacity] + "%   " + MODEL_NAMES[model]
+                        + (mode == MODE_BOTH ? "   + " + Diffusion.NAMES[diffusion] : "");
+        topBar.setText(status + "GHOSTS   " + what
                 + (queued > 0 ? "" : "   (Fn: menu)"));
     }
 
@@ -1357,7 +1392,10 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         model = clamp(prefs.getInt("model", 1), MODEL_SIZES.length);
         glow = clamp(prefs.getInt("glow", 2), GLOW_NAMES.length);
         largeCopy = prefs.getBoolean("largecopy", false);
-        cpu = clamp(prefs.getInt("cpu", 2), CPU_CHOICES.length);
+        mode = clamp(prefs.getInt("mode", MODE_GHOSTS), MODE_NAMES.length);
+        diffusion = Math.max(1, clamp(prefs.getInt("diffusion", 6), Diffusion.NAMES.length));
+        look = clamp(prefs.getInt("look", Ghost.ETHEREAL), Ghost.LOOKS.length);
+        opacity = clamp(prefs.getInt("opacity", 1), OPACITIES.length);
         dro = Math.max(0, prefs.getInt("dro", 0));
         savedWb = prefs.getString("wb", null);
         savedKelvin = prefs.getInt("kelvin", 5500);
@@ -1373,7 +1411,10 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
                 .putInt("model", model)
                 .putInt("glow", glow)
                 .putBoolean("largecopy", largeCopy)
-                .putInt("cpu", cpu)
+                .putInt("mode", mode)
+                .putInt("diffusion", diffusion)
+                .putInt("look", look)
+                .putInt("opacity", opacity)
                 .putInt("dro", dro)
                 .putString("wb", savedWb)
                 .putInt("kelvin", savedKelvin)

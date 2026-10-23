@@ -322,8 +322,26 @@ static void kernel4x4(const float *ap, const float *bp, float *c, int K) {
     c[12] = c30; c[13] = c31; c[14] = c32; c[15] = c33;
 }
 
+/* e^x to about 1e-7 relative error: 2^(x log2 e) split into an integer power (exponent bits)
+ * and a polynomial for the fraction. Several times quicker than expf on the camera. */
+static inline float fast_exp(float x) {
+    if (x < -87.0f) x = -87.0f;
+    if (x > 88.0f) x = 88.0f;
+    float t = x * 1.44269504f;
+    int i = (int) t;
+    if (t < i) i--; /* floor */
+    float f = t - i;
+    float p = 1.0f + f * (0.69314718f + f * (0.24022650f + f * (0.05550411f + f * (0.00961813f + f * (0.00133336f + f * 0.00015403f)))));
+    union {
+        float f;
+        int i;
+    } u;
+    u.i = (i + 127) << 23;
+    return p * u.f;
+}
+
 static inline float silu(float v) {
-    return v / (1.0f + expf(-v));
+    return v / (1.0f + fast_exp(-v));
 }
 
 typedef struct {
@@ -364,6 +382,24 @@ static void gather(const ConvJob *j, int pix, int npix, float *bp) {
     }
     int cin = K / (k * k);
     float *dst = bp;
+    /* most panels: 4 pixels on one row with their whole window inside the image, so no edge checks */
+    if (npix == 4 && y0[0] == y0[3] && y0[0] >= 0 && y0[0] + k <= H && x0[0] >= 0 && x0[3] + k <= W) {
+        int xa = x0[0], xb = x0[1], xc = x0[2], xd = x0[3];
+        for (int ci = 0; ci < cin; ci++) {
+            const float *plane = in->d + (size_t) ci * HW + (size_t) y0[0] * W;
+            for (int ky = 0; ky < k; ky++) {
+                const float *row = plane + ky * W;
+                for (int kx = 0; kx < k; kx++) {
+                    dst[0] = row[xa + kx];
+                    dst[1] = row[xb + kx];
+                    dst[2] = row[xc + kx];
+                    dst[3] = row[xd + kx];
+                    dst += 4;
+                }
+            }
+        }
+        return;
+    }
     for (int ci = 0; ci < cin; ci++) {
         const float *plane = in->d + (size_t) ci * HW;
         for (int ky = 0; ky < k; ky++) {
