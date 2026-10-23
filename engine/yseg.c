@@ -851,7 +851,22 @@ static float iou(const Det *a, const Det *b) {
     return u > 0 ? inter / u : 0;
 }
 
+/* The best logit among the wanted classes at anchor i (classes == NULL: class 0 only). */
+static float best_logit(const Tensor *cls, int i, const unsigned char *classes) {
+    int N = cls->h * cls->w;
+    if (!classes || cls->c == 1) return cls->d[i];
+    float best = -1e30f;
+    for (int c = 0; c < cls->c; c++) {
+        if (classes[c] && cls->d[(size_t) c * N + i] > best) best = cls->d[(size_t) c * N + i];
+    }
+    return best;
+}
+
 int yseg_people(YSeg *m, float conf, float iou_max, unsigned char *mask, int max_people) {
+    return yseg_objects(m, conf, iou_max, mask, max_people, NULL);
+}
+
+int yseg_objects(YSeg *m, float conf, float iou_max, unsigned char *mask, int max_people, const unsigned char *classes) {
     if (m->nout != 10) return -1;
     float logit_min = logf(conf / (1 - conf));
     int R = m->reg_max;
@@ -859,7 +874,7 @@ int yseg_people(YSeg *m, float conf, float iou_max, unsigned char *mask, int max
     for (int l = 0; l < 3; l++) {
         Tensor *cls = &m->t[m->outputs[3 * l + 1]];
         int N = cls->h * cls->w;
-        for (int i = 0; i < N; i++) if (cls->d[i] >= logit_min) total++;
+        for (int i = 0; i < N; i++) if (best_logit(cls, i, classes) >= logit_min) total++;
     }
     Det *dets = malloc(sizeof(Det) * (total > 0 ? total : 1));
     if (!dets) return -1;
@@ -871,7 +886,7 @@ int yseg_people(YSeg *m, float conf, float iou_max, unsigned char *mask, int max
         int N = cls->h * cls->w, W = cls->w;
         float s = (float) m->strides[l];
         for (int i = 0; i < N; i++) {
-            float lg = cls->d[i];
+            float lg = best_logit(cls, i, classes);
             if (lg < logit_min) continue;
             float dist[4];
             for (int side = 0; side < 4; side++) {

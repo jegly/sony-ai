@@ -18,10 +18,13 @@ public class Yseg {
         handle = nativeLoad(assets, name);
     }
 
-    /** People mask (0..255 per pixel, w x h) for an RGB image; returns how many people were found. */
-    public int run(byte[] rgb, int w, int h, int threads, float conf, byte[] mask, double[] timings) throws IOException {
+    /**
+     * Mask (0..255 per pixel, w x h) of the wanted COCO classes (classes[c] != 0; null = people) for an RGB
+     * image; returns how many were found.
+     */
+    public int run(byte[] rgb, int w, int h, int threads, float conf, byte[] classes, byte[] mask, double[] timings) throws IOException {
         if (handle == 0) throw new IOException("model was freed");
-        return nativeRun(handle, rgb, w, h, threads, conf, mask, timings);
+        return nativeRun(handle, rgb, w, h, threads, conf, classes, mask, timings);
     }
 
     /** Boxes of the people found by the last run: x1 y1 x2 y2 score each, in model input pixels. */
@@ -50,6 +53,6 @@ public class Yseg {
 
     private static native int nativeRunRaw(int handle, byte[] rgb, int w, int h, float[] out) throws IOException;
 
-    private static native int nativeRun(int handle, byte[] rgb, int w, int h, int threads, float conf, byte[] mask,
-            double[] timings) throws IOException;
+    private static native int nativeRun(int handle, byte[] rgb, int w, int h, int threads, float conf, byte[] classes,
+            byte[] mask, double[] timings) throws IOException;
 }

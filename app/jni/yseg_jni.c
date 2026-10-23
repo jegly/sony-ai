@@ -86,7 +86,7 @@ JNIEXPORT jint JNICALL Java_com_ghosts_app_Yseg_nativeRunRaw(JNIEnv *env, jclass
 /* Runs the model on rgb (w*h*3 bytes) and writes the people mask (w*h) into mask.
  * Returns the number of people. timings (9 doubles, may be null) gets ms per op type. */
 JNIEXPORT jint JNICALL Java_com_ghosts_app_Yseg_nativeRun(JNIEnv *env, jclass cls, jint handle, jbyteArray jrgb,
-        jint w, jint h, jint threads, jfloat conf, jbyteArray jmask, jdoubleArray jtimes) {
+        jint w, jint h, jint threads, jfloat conf, jbyteArray jclasses, jbyteArray jmask, jdoubleArray jtimes) {
     YSeg *m = (YSeg *) (intptr_t) handle;
     if ((*env)->GetArrayLength(env, jrgb) < w * h * 3 || (*env)->GetArrayLength(env, jmask) < w * h) {
         throw_error(env, "buffer too small");
@@ -101,8 +101,14 @@ JNIEXPORT jint JNICALL Java_com_ghosts_app_Yseg_nativeRun(JNIEnv *env, jclass cl
         return -1;
     }
     (*env)->GetByteArrayRegion(env, jrgb, 0, w * h * 3, (jbyte *) rgb);
+    unsigned char classes[80];
+    int nc = jclasses ? (*env)->GetArrayLength(env, jclasses) : 0;
+    if (nc > 80) nc = 80;
+    memset(classes, 0, sizeof classes);
+    if (nc > 0) (*env)->GetByteArrayRegion(env, jclasses, 0, nc, (jbyte *) classes);
+    else classes[0] = 1;
     int n = -1;
-    if (yseg_run(m, rgb, w, h, threads) == 0) n = yseg_people(m, conf, 0.7f, mask, 300);
+    if (yseg_run(m, rgb, w, h, threads) == 0) n = yseg_objects(m, conf, 0.7f, mask, 300, classes);
     free(rgb);
     if (n < 0) {
         free(mask);

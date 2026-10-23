@@ -36,7 +36,20 @@ public class Mesh {
         faceDim = d;
     }
 
+    /** Face styles for addFace. */
+    public static final int FACE_MESH = 0, FACE_POINTS = 1, FACE_EYES = 2;
+    public static final String[] FACE_STYLES = {"Mesh", "Points", "Mesh + glowing eyes"};
+
+    private final boolean pointsOnly;
+    private final List<float[]> blobs = new ArrayList<float[]>(); // glowing eyes: x, y, core radius, glow radius (mask px)
+
     public Mesh(byte[] mask, int mw, int mh, float dim, int glowLevel, float[] colour, long seed) {
+        this(mask, mw, mh, dim, glowLevel, colour, seed, false);
+    }
+
+    /** With pointsOnly, a point cloud: closer points, no edges and no outline. */
+    public Mesh(byte[] mask, int mw, int mh, float dim, int glowLevel, float[] colour, long seed, boolean pointsOnly) {
+        this.pointsOnly = pointsOnly;
         this.mw = mw;
         this.mh = mh;
         this.dim = dim;
@@ -60,7 +73,7 @@ public class Mesh {
         Ghost.gaussian(dist, mw, mh, Math.max(1, Math.round(mw / 320f)));
 
         // 1. points: along the outline first, then filling the inside
-        float s = Math.max(5f, mw / 42f);
+        float s = Math.max(pointsOnly ? 3f : 5f, mw / (pointsOnly ? 90f : 42f));
         Random rnd = new Random(seed);
         PointSet pts = new PointSet(mw, mh, s);
         List<Integer> edge = new ArrayList<Integer>();
@@ -108,6 +121,10 @@ public class Mesh {
      * @param pts face landmarks in mask pixels (x, y pairs)
      */
     public void addFace(float[] pts, FaceMesh mesh) {
+        addFace(pts, mesh, pointsOnly ? FACE_POINTS : FACE_MESH);
+    }
+
+    public void addFace(float[] pts, FaceMesh mesh, int style) {
         int n = mesh.oval.length;
         float[] ox = new float[n], oy = new float[n];
         for (int i = 0; i < n; i++) {
@@ -123,6 +140,21 @@ public class Mesh {
             float mx = (px[e[0]] + px[e[1]]) / 2, my = (py[e[0]] + py[e[1]]) / 2;
             if (hidden[e[0]] || hidden[e[1]] || inPolygon(mx, my, ox, oy)) it.remove();
         }
+        faces++;
+        if (style == FACE_POINTS) {
+            for (int i = 0; i < pts.length / 2; i++) extraDots.add(new float[] {pts[2 * i], pts[2 * i + 1], 1.5f});
+            return;
+        }
+        if (style == FACE_EYES && pts.length >= 478 * 2) {
+            for (int c : new int[] {468, 473}) {
+                float r = 0;
+                for (int k = 1; k <= 4; k++) {
+                    float dx = pts[2 * (c + k)] - pts[2 * c], dy = pts[2 * (c + k) + 1] - pts[2 * c + 1];
+                    r += (float) Math.sqrt(dx * dx + dy * dy) / 4;
+                }
+                blobs.add(new float[] {pts[2 * c], pts[2 * c + 1], r * 0.9f, r * 4.5f});
+            }
+        }
         HashSet<Long> feature = new HashSet<Long>();
         for (int i = 0; i < mesh.features.length; i += 2) {
             int a = mesh.features[i], b = mesh.features[i + 1];
@@ -137,8 +169,7 @@ public class Mesh {
             int a = mesh.features[i], b = mesh.features[i + 1];
             extraLines.add(new float[] {pts[2 * a], pts[2 * a + 1], pts[2 * b], pts[2 * b + 1], 1f});
         }
-        for (int i = 0; i < pts.length / 2; i++) extraDots.add(new float[] {pts[2 * i], pts[2 * i + 1]});
-        faces++;
+        for (int i = 0; i < pts.length / 2; i++) extraDots.add(new float[] {pts[2 * i], pts[2 * i + 1], 1.1f});
     }
 
     public int faces() {
@@ -239,14 +270,15 @@ public class Mesh {
         if (light.length < w * count) light = new float[w * count];
         java.util.Arrays.fill(light, 0, w * count, 0f);
         // mesh edges, the extra lines, then the dots
-        for (int[] e : edges) {
+        for (int[] e : pointsOnly ? new ArrayList<int[]>() : edges) {
             drawLine(px[e[0]] * sxs, py[e[0]] * sys, px[e[1]] * sxs, py[e[1]] * sys, half, 0.8f, y, count, w);
         }
         for (float[] l : extraLines) drawLine(l[0] * sxs, l[1] * sys, l[2] * sxs, l[3] * sys, half * 0.7f, l[4], y, count, w);
         for (int i = 0; i < px.length; i++) {
-            if (hidden == null || !hidden[i]) drawDot(px[i] * sxs, py[i] * sys, dot, 1f, y, count, w);
+            if (hidden == null || !hidden[i]) drawDot(px[i] * sxs, py[i] * sys, pointsOnly ? dot * 0.8f : dot, 1f, y, count, w);
         }
-        for (float[] d : extraDots) drawDot(d[0] * sxs, d[1] * sys, half * 1.1f, 0.8f, y, count, w);
+        for (float[] d : extraDots) drawDot(d[0] * sxs, d[1] * sys, half * d[2], 0.8f, y, count, w);
+        for (float[] b : blobs) drawBlob(b[0] * sxs, b[1] * sys, b[2] * sxs, b[3] * sxs, y, count, w);
 
         float[][] boxes = new float[ovals.size()][];
         for (int k = 0; k < boxes.length; k++) boxes[k] = bounds(ovals.get(k));
@@ -275,8 +307,8 @@ public class Mesh {
                 }
                 if (dPx < -outlineHalf * 8 && l == 0) continue;
                 float a = lerp2(alpha, a0, a1, b0, b1, wx, wy);
-                float outline = line(Math.abs(dPx), outlineHalf);
-                float halo = glow * 0.4f * soft(Math.abs(dPx), outlineHalf * 7) * (1 - a * 0.7f);
+                float outline = pointsOnly ? 0 : line(Math.abs(dPx), outlineHalf);
+                float halo = pointsOnly ? 0 : glow * 0.4f * soft(Math.abs(dPx), outlineHalf * 7) * (1 - a * 0.7f);
                 float lit = Math.min(1, Math.max(outline, l * Math.max(a, 0.6f)) + halo);
                 if (lit < 0.002f && a < 0.002f) continue;
                 int c = rgb[base + x];
@@ -313,6 +345,22 @@ public class Mesh {
                 else if (t > 1) t = 1;
                 float ex = ax + t * dx - cx, ey = ay + t * dy - cy;
                 float v = line((float) Math.sqrt(ex * ex + ey * ey), half) * strength;
+                if (v > light[base + xx]) light[base + xx] = v;
+            }
+        }
+    }
+
+    /** A glowing eye: a solid core and a wide soft glow. */
+    private void drawBlob(float cx0, float cy0, float core, float r, int y, int count, int w) {
+        int ry0 = Math.max(y, (int) Math.floor(cy0 - r - 1)), ry1 = Math.min(y + count - 1, (int) Math.ceil(cy0 + r + 1));
+        if (ry0 > ry1) return;
+        int rx0 = Math.max(0, (int) Math.floor(cx0 - r - 1)), rx1 = Math.min(w - 1, (int) Math.ceil(cx0 + r + 1));
+        for (int yy = ry0; yy <= ry1; yy++) {
+            int base = (yy - y) * w;
+            for (int xx = rx0; xx <= rx1; xx++) {
+                float ex = xx + 0.5f - cx0, ey = yy + 0.5f - cy0;
+                float d = (float) Math.sqrt(ex * ex + ey * ey);
+                float v = Math.max(line(d, core), 0.9f * soft(d, r));
                 if (v > light[base + xx]) light[base + xx] = v;
             }
         }

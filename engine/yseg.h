@@ -24,6 +24,10 @@ int yseg_num_outputs(YSeg *m);
  * were found, or -1 if out of memory. */
 int yseg_people(YSeg *m, float conf, float iou, unsigned char *mask, int max_people);
 
+/* Like yseg_people for any COCO classes: classes[c] != 0 for the wanted ones (80 entries). NMS is done
+ * across the wanted classes together. */
+int yseg_objects(YSeg *m, float conf, float iou, unsigned char *mask, int max_objects, const unsigned char *classes);
+
 /* After yseg_people: the people's boxes (x1 y1 x2 y2 score in input pixels, best first), up to max.
  * Returns how many. */
 int yseg_boxes(YSeg *m, float *out, int max);

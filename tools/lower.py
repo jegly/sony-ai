@@ -12,8 +12,8 @@ Ops (tensors are float CHW, batch 1; tensor 0 is the RGB input, 0..1):
   CONVT2  in out cin cout                             + fp16 weights [cin][cout][2][2], fp32 bias
   ATTN    qkv out v heads key_dim head_dim            (YOLO11 PSA attention, see Attention.forward)
 
-Only the "person" class is kept in the classifier head. Outputs, in order: for each of the three
-scales, box (64 ch, DFL), person logit (1 ch), mask coefficients (32 ch); then the mask protos.
+Outputs, in order: for each of the three scales, box (64 ch, DFL), class logits (80 COCO classes, or
+only "person" with --person-only), mask coefficients (32 ch); then the mask protos.
 """
 import struct
 import sys
@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 OP_CONV, OP_ADD, OP_CONCAT, OP_SLICE, OP_MAXPOOL, OP_UP2, OP_CONVT2, OP_ATTN = range(1, 9)
 PERSON = 0
+CLASSES = slice(PERSON, PERSON + 1) if "--person-only" in sys.argv else slice(None)
 
 
 class Graph:
@@ -177,7 +178,7 @@ class Graph:
             elif name == "Segment":
                 for lvl, f in enumerate(src):
                     outs.append(self.seq_conv(f, m.cv2[lvl]))
-                    outs.append(self.seq_conv(f, m.cv3[lvl], slice(PERSON, PERSON + 1)))
+                    outs.append(self.seq_conv(f, m.cv3[lvl], CLASSES))
                     outs.append(self.seq_conv(f, m.cv4[lvl]))
                 p = m.proto
                 outs.append(self.Conv(self.Conv(self.convt2(self.Conv(src[0], p.cv1), p.upsample), p.cv2), p.cv3))
@@ -264,7 +265,7 @@ def main():
             feats = [saved[f] for f in head.f]
             want = []
             for lvl in range(3):
-                want += [head.cv2[lvl](feats[lvl]), head.cv3[lvl](feats[lvl])[:, PERSON:PERSON + 1], head.cv4[lvl](feats[lvl])]
+                want += [head.cv2[lvl](feats[lvl]), head.cv3[lvl](feats[lvl])[:, CLASSES], head.cv4[lvl](feats[lvl])]
             want.append(head.proto(feats[0]))
             for half in (False, True):
                 got = run_ref(g, x, half)

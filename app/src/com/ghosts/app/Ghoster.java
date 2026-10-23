@@ -47,9 +47,12 @@ public class Ghoster {
         public float opacity = 0.85f;
         /** Colour of the figures' light, see Ghost.COLOURS. */
         public int colour = 0;
-        /** What to do with people: PEOPLE_OFF (only the diffusion filter), PEOPLE_GHOSTS, PEOPLE_WIREFRAME (a
-         * triangle mesh, with face meshes on faces) or PEOPLE_CONTOURS. */
+        /** The effect on the subjects (PEOPLE_* below); PEOPLE_OFF applies only the diffusion filter. */
         public int people = PEOPLE_GHOSTS;
+        /** Which COCO classes are subjects (80 flags; null = people). */
+        public byte[] classes;
+        /** Face style for meshed faces, see Mesh.FACE_STYLES. */
+        public int faceStyle = Mesh.FACE_MESH;
         /** Diffusion filter setting, see Diffusion.NAMES (0 = off). */
         public int diffusion = 0;
         /** Copy size as a fraction of the photo: 2 = half (Large), 4 = quarter (Small). */
@@ -58,7 +61,11 @@ public class Ghoster {
         public float confidence = 0.2f;
     }
 
-    public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3, PEOPLE_FACES = 4;
+    public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3, PEOPLE_FACES = 4,
+            PEOPLE_POINTS = 5, PEOPLE_COLOUR_POP = 6, PEOPLE_BOKEH = 7, PEOPLE_SPOTLIGHT = 8, PEOPLE_GLITCH = 9, PEOPLE_THERMAL = 10,
+            PEOPLE_HALFTONE = 11;
+    /** Effects done by Scene, in Scene's order from PEOPLE_COLOUR_POP. */
+    private static final int SCENE_FIRST = PEOPLE_COLOUR_POP, SCENE_LAST = PEOPLE_HALFTONE;
     private static final String MODEL = "yolo11n-seg.bin";
     private static final long MB = 1024 * 1024;
     private static final int STRIP = 64;
@@ -228,7 +235,7 @@ public class Ghoster {
                 long loadMs = System.currentTimeMillis() - tl;
                 mask = new byte[mw * mh];
                 double[] times = new double[9];
-                people = model[0].run(rgb, mw, mh, opt.threads, opt.confidence, mask, times);
+                people = model[0].run(rgb, mw, mh, opt.threads, opt.confidence, opt.classes, mask, times);
                 long t3 = System.currentTimeMillis();
                 sb.append(" model ").append(t3 - tl - loadMs).append(" ms (").append(opt.threads)
                         .append(opt.threads == 1 ? " thread" : " threads");
@@ -246,7 +253,7 @@ public class Ghoster {
                 int qw0 = sideways ? mh : mw, qh0 = sideways ? mw : mh;
                 faceOnly = new Mesh(new byte[qw0 * qh0], qw0, qh0, 0, opt.glow, Ghost.tint(opt.colour), 0);
                 faceOnly.setFaceDim(opt.opacity * 0.5f);
-                sb.append(", ").append(addFaces(faceOnly, model, null, mw, deg, full, src, opt.sample, qw0));
+                sb.append(", ").append(addFaces(faceOnly, model, null, mw, deg, full, src, opt.sample, qw0, opt.faceStyle));
                 people = faceOnly.faces();
             }
             peopleOut[0] = people;
@@ -263,22 +270,31 @@ public class Ghoster {
             for (int i = 0; i < index.length; i++) ppx[i] = px[index[i]];
             Ghost ghostV = null;
             Wireframe wireV = null;
+            Scene sceneV = null;
             Mesh meshV = faceOnly;
             if (people > 0 && faceOnly == null) {
                 byte[] pmask = new byte[mask.length];
                 for (int i = 0; i < index.length; i++) pmask[i] = mask[index[i]];
                 if (opt.people == PEOPLE_CONTOURS) {
                     wireV = new Wireframe(pmask, qw, qh, opt.opacity, opt.glow, Ghost.tint(opt.colour));
-                } else if (opt.people == PEOPLE_WIREFRAME) {
+                } else if (opt.people == PEOPLE_WIREFRAME || opt.people == PEOPLE_POINTS) {
                     long tm = System.currentTimeMillis();
-                    meshV = new Mesh(pmask, qw, qh, opt.opacity, opt.glow, Ghost.tint(opt.colour), src.getName().hashCode());
+                    boolean points = opt.people == PEOPLE_POINTS;
+                    meshV = new Mesh(pmask, qw, qh, opt.opacity, opt.glow, Ghost.tint(opt.colour), src.getName().hashCode(), points);
                     sb.append(", mesh ").append(meshV.points()).append(" points in ").append(System.currentTimeMillis() - tm).append(" ms");
-                    try {
-                        sb.append(", ").append(addFaces(meshV, model, model[0].boxes(), mw, deg, full, src, opt.sample, qw));
-                    } catch (IOException e) {
-                        if (cancelled) throw e;
-                        sb.append(", faces failed: ").append(e.getMessage());
+                    // faces only make sense when the subjects are people
+                    if (opt.classes == null || (opt.classes[0] != 0 && countOn(opt.classes) == 1)) {
+                        try {
+                            sb.append(", ").append(addFaces(meshV, model, model[0].boxes(), mw, deg, full, src, opt.sample, qw,
+                                    points ? Mesh.FACE_POINTS : opt.faceStyle));
+                        } catch (IOException e) {
+                            if (cancelled) throw e;
+                            sb.append(", faces failed: ").append(e.getMessage());
+                        }
                     }
+                } else if (opt.people >= SCENE_FIRST && opt.people <= SCENE_LAST) {
+                    sceneV = new Scene(opt.people - SCENE_FIRST, pmask, qw, qh, ppx, opt.opacity, Ghost.tint(opt.colour),
+                            src.getName().hashCode());
                 } else {
                     ghostV = new Ghost(pmask, qw, qh, opt.glow, opt.look, opt.opacity, opt.colour, ppx);
                 }
@@ -286,12 +302,14 @@ public class Ghoster {
             final Ghost ghost = ghostV;
             final Wireframe wire = wireV;
             final Mesh mesh = meshV;
+            final Scene scene = sceneV;
             final Diffusion diffusion;
             if (opt.diffusion > 0) {
                 // the filter sits in front of the lens, so the ghosts' own light gets diffused too
                 int[] lit = ppx;
-                if (ghost != null || wire != null || mesh != null) {
+                if (ghost != null || wire != null || mesh != null || scene != null) {
                     lit = ppx.clone();
+                    if (scene != null) scene.apply(lit, 0, qh, qw, qh);
                     if (ghost != null) ghost.apply(lit, 0, qh, qw, qh);
                     if (wire != null) wire.apply(lit, 0, qh, qw, qh);
                     if (mesh != null) mesh.apply(lit, 0, qh, qw, qh);
@@ -302,6 +320,7 @@ public class Ghoster {
             }
             Effect effect = new Effect() {
                 public void apply(int[] rows, int y, int count, int w, int h) {
+                    if (scene != null) scene.apply(rows, y, count, w, h);
                     if (ghost != null) ghost.apply(rows, y, count, w, h);
                     if (wire != null) wire.apply(rows, y, count, w, h);
                     if (mesh != null) mesh.apply(rows, y, count, w, h);
@@ -347,7 +366,7 @@ public class Ghoster {
      * Returns a note for the log.
      */
     private String addFaces(Mesh mesh, Yseg[] model, float[] boxes, int mw, int deg, Bitmap full, File src, int sample,
-            int qw) throws IOException {
+            int qw, int style) throws IOException {
         if (boxes != null && boxes.length == 0) return "";
         if (faceMesh == null) faceMesh = new FaceMesh(assets.open("facemesh.bin"));
         long t0 = System.currentTimeMillis();
@@ -384,7 +403,7 @@ public class Ghoster {
                     if (cancelled) throw new IOException("cancelled");
                     if (Math.max(fs.w, fs.h) < MIN_HEAD / 3) continue;
                     stage("Meshing faces");
-                    if (meshFace(mesh, model, fs, t, full, dec, sample, fw, fh, qw)) found++;
+                    if (meshFace(mesh, model, fs, t, full, dec, sample, fw, fh, qw, style)) found++;
                 }
                 return found + (found == 1 ? " face" : " faces") + " (" + tried + " squares scanned, "
                         + (System.currentTimeMillis() - t0) + " ms)";
@@ -403,7 +422,7 @@ public class Ghoster {
                 FaceMesh.Face f = FaceMesh.detect(model[1].runRaw(crop, FaceMesh.DET_SIZE, FaceMesh.DET_SIZE, FaceMesh.DET_FLOATS), 0.5f);
                 if (f == null) continue;
                 stage("Meshing faces");
-                if (meshFace(mesh, model, FaceMesh.toSource(f, cm), t, full, dec, sample, fw, fh, qw)) found++;
+                if (meshFace(mesh, model, FaceMesh.toSource(f, cm), t, full, dec, sample, fw, fh, qw, style)) found++;
             }
         } finally {
             if (dec != null) dec.recycle();
@@ -414,7 +433,7 @@ public class Ghoster {
 
     /** Runs the landmark model on one face (upright copy pixels) and adds its mesh; false if it isn't a face after all. */
     private boolean meshFace(Mesh mesh, Yseg[] model, FaceMesh.Face fs, double[] t, Bitmap full, BitmapRegionDecoder dec,
-            int sample, int fw, int fh, int qw) throws IOException {
+            int sample, int fw, int fh, int qw, int style) throws IOException {
         double[] lmFile = compose(t, FaceMesh.landmarkCrop(fs));
         byte[] lcrop = crop(full, dec, sample, fw, fh, lmFile, FaceMesh.LM_SIZE, FaceMesh.LM_SIZE);
         if (model[2] == null) model[2] = new Yseg(assets, "face_landmarks.bin");
@@ -423,7 +442,7 @@ public class Ghoster {
         float[] pts = FaceMesh.landmarks(out, lmFile);
         float toMask = (float) qw / fw;
         for (int k = 0; k < pts.length; k++) pts[k] *= toMask;
-        mesh.addFace(pts, faceMesh);
+        mesh.addFace(pts, faceMesh, style);
         return true;
     }
 
@@ -476,6 +495,12 @@ public class Ghoster {
         }
         double[] shifted = {m[0], m[1], m[2] - rx, m[3], m[4], m[5] - ry};
         return FaceMesh.warp(px, rw, rh, shifted, ow, oh);
+    }
+
+    private static int countOn(byte[] flags) {
+        int n = 0;
+        for (byte b : flags) if (b != 0) n++;
+        return n;
     }
 
     private static int round32(float v) {
