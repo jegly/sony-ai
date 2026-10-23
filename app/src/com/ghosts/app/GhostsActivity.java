@@ -44,11 +44,12 @@ import java.util.List;
 
 /**
  * Ghosts: after each shot, finds the people in the photo (YOLO11n-seg, run on the camera's own CPU) and
- * saves a copy in GHOSTS with them turned into glowing white figures. It can also (or instead) add a
- * diffusion filter look, like a Black Pro-Mist.
+ * saves a copy in GHOSTS with them turned into glowing white figures or glowing wireframes. It can also (or
+ * instead) add a diffusion filter look, like a Black Pro-Mist. Nothing is on until picked in the Fn menu.
  *
  * Controls (A7 II): rear dial = shutter (S/M) or exposure comp (P/A), front dial = ISO, Fn = menu
- * (mode, diffusion, model size, look, opacity, glow, copy size, white balance, Kelvin, D-Range: up/down picks a row, left/right or
+ * (people, diffusion, model size, look, opacity, colour, glow, copy size, Sony's live soft focus or soft high-key,
+ * soft skin, white balance, Kelvin, D-Range: up/down picks a row, left/right or
  * the wheel changes it), centre = focus magnifier, C3 = white balance, DISP/up = info on/off,
  * Play = review photos (C1: ghost copy or original, C2: ghost this photo), MENU = exit.
  */
@@ -72,12 +73,11 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     private boolean overlay = true;
 
     // Fn menu: one row per setting
-    private static final String[] MENU_ROWS = {"Mode", "Diffusion", "Model", "Look", "Opacity", "Glow", "Copy size", "WB",
-            "Kelvin", "D-Range"};
-    private static final int ROW_MODE = 0, ROW_DIFFUSION = 1, ROW_MODEL = 2, ROW_LOOK = 3, ROW_OPACITY = 4, ROW_GLOW = 5,
-            ROW_SIZE = 6, ROW_WB = 7, ROW_KELVIN = 8, ROW_DRO = 9;
-    private static final String[] MODE_NAMES = {"Ghosts", "Diffusion", "Ghosts + diffusion"};
-    private static final int MODE_GHOSTS = 0, MODE_DIFFUSION = 1, MODE_BOTH = 2;
+    private static final String[] MENU_ROWS = {"People", "Diffusion", "Model", "Look", "Opacity", "Colour", "Glow", "Copy size",
+            "Live", "Soft skin", "WB", "Kelvin", "D-Range"};
+    private static final int ROW_PEOPLE = 0, ROW_DIFFUSION = 1, ROW_MODEL = 2, ROW_LOOK = 3, ROW_OPACITY = 4, ROW_COLOUR = 5,
+            ROW_GLOW = 6, ROW_SIZE = 7, ROW_LIVE = 8, ROW_SKIN = 9, ROW_WB = 10, ROW_KELVIN = 11, ROW_DRO = 12;
+    private static final String[] PEOPLE_NAMES = {"Off", "Ghosts", "Wireframe"};
     private static final int[] MODEL_SIZES = {320, 480, 640};
     private static final String[] MODEL_NAMES = {"Fast", "Normal", "Fine"};
     private static final String[] MODEL_NOTES = {"320 px, finds fewer people", "480 px", "640 px, slowest, finds the most people"};
@@ -85,15 +85,24 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     private static final int[] OPACITIES = {100, 85, 70, 50, 30};
     private static final String[] LOOK_NOTES = {"opaque white", "feathered, halo of light", "ethereal in a hazy, softer scene"};
     private boolean menuOpen;
-    private int menuRow = ROW_MODE;
+    private int menuRow = ROW_PEOPLE;
     private int model = 1;
     private int glow = 2;
     private boolean largeCopy;
-    private int mode = MODE_GHOSTS;
-    /** Diffusion setting, 1.. (Diffusion.NAMES; 0 "Off" isn't offered, Mode turns it off). */
-    private int diffusion = 6;
+    /** Nothing is on until the user picks something: no copies are made. */
+    private int people = Ghoster.PEOPLE_OFF;
+    /** Diffusion setting, see Diffusion.NAMES (0 = off). */
+    private int diffusion = 0;
     private int look = Ghost.ETHEREAL;
     private int opacity = 1;
+    private int colour = 0;
+    // Sony's own effects, which show in the viewfinder and go into the camera's JPEG (JPEG quality only)
+    private final List<String> liveNames = new ArrayList<String>();
+    private final List<String[]> liveValues = new ArrayList<String[]>(); // {effect, level or tint}
+    private int live;
+    private String liveKey = "Off";
+    private final List<String> skinModes = new ArrayList<String>();
+    private String skin = "off";
     // Sony's D-Range Optimizer: 0 off, 1 auto, 2.. level 1..maxDro
     private int dro;
     private int maxDro = 5;
@@ -200,7 +209,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
                             showMessage((people == 0 ? "No people, diffused copy saved: " : "Diffused copy saved: ")
                                     + result.getName() + " (" + (millis / 1000) + " s)");
                         } else {
-                            showMessage(people + (people == 1 ? " ghost" : " ghosts") + " saved: " + result.getName()
+                            showMessage(people + (people == 1 ? " person" : " people") + " done, saved: " + result.getName()
                                     + " (" + (millis / 1000) + " s)");
                         }
                         if (playback) showPhoto();
@@ -250,6 +259,9 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     private void startShooting() {
         if (savedWb != null) setWhiteBalance(savedWb, savedKelvin, false);
         applyDro();
+        live = Math.max(0, liveNames.indexOf(liveKey));
+        if (live > 0) applyLive(false);
+        applySkin();
         applyModeDial();
         applyEvDial();
         refreshAll();
@@ -308,6 +320,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         if (camera == null) return;
         handler.removeCallbacks(poll);
         stopMagnifier();
+        clearSonyEffects();
         try {
             camera.getNormalCamera().stopPreview();
         } catch (Throwable t) {
@@ -359,6 +372,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             } catch (Throwable t) {
                 log("dro capabilities failed: " + t);
             }
+            readEffects(m);
             wbModes.clear();
             List<String> wb = sup.getSupportedWhiteBalance();
             for (String mode : WB_ORDER) {
@@ -403,14 +417,12 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     /** Left/right or the wheel: change the value on the highlighted row. */
     private void menuChange(int dir) {
         switch (menuRow) {
-            case ROW_MODE:
-                mode = (mode + dir + MODE_NAMES.length) % MODE_NAMES.length;
+            case ROW_PEOPLE:
+                people = (people + dir + PEOPLE_NAMES.length) % PEOPLE_NAMES.length;
                 break;
-            case ROW_DIFFUSION: {
-                int n = Diffusion.NAMES.length - 1;
-                diffusion = (diffusion - 1 + dir + n) % n + 1;
+            case ROW_DIFFUSION:
+                diffusion = (diffusion + dir + Diffusion.NAMES.length) % Diffusion.NAMES.length;
                 break;
-            }
             case ROW_MODEL:
                 model = (model + dir + MODEL_SIZES.length) % MODEL_SIZES.length;
                 break;
@@ -425,6 +437,23 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
                 break;
             case ROW_OPACITY:
                 opacity = (opacity + dir + OPACITIES.length) % OPACITIES.length;
+                break;
+            case ROW_COLOUR:
+                colour = (colour + dir + Ghost.COLOURS.length) % Ghost.COLOURS.length;
+                break;
+            case ROW_LIVE:
+                if (liveNames.size() > 1) {
+                    live = (live + dir + liveNames.size()) % liveNames.size();
+                    liveKey = liveNames.get(live);
+                    applyLive(true);
+                }
+                break;
+            case ROW_SKIN:
+                if (skinModes.size() > 1) {
+                    int i = Math.max(0, skinModes.indexOf(skin));
+                    skin = skinModes.get((i + dir + skinModes.size()) % skinModes.size());
+                    applySkin();
+                }
                 break;
             case ROW_WB:
                 if (!wbModes.isEmpty()) {
@@ -452,15 +481,18 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         if (!menuOpen && pickerPanel.getVisibility() != View.GONE) repaintSoon();
         pickerPanel.setVisibility(menuOpen ? View.VISIBLE : View.GONE);
         if (!menuOpen) return;
-        boolean ghostsOn = mode != MODE_DIFFUSION, diffusionOn = mode != MODE_GHOSTS;
+        boolean ghostsOn = people == Ghoster.PEOPLE_GHOSTS, peopleOn = people != Ghoster.PEOPLE_OFF;
         String[] values = {
-            MODE_NAMES[mode] + (mode == MODE_DIFFUSION ? "  (no AI, quick)" : ""),
-            Diffusion.NAMES[diffusion] + (diffusionOn ? "" : "  (Mode is Ghosts)"),
+            PEOPLE_NAMES[people] + (people == Ghoster.PEOPLE_WIREFRAME ? "  (Opacity dims the person)" : ""),
+            Diffusion.NAMES[diffusion] + (diffusion > 0 && !peopleOn ? "  (no AI, quick)" : ""),
             MODEL_NAMES[model] + "  (" + MODEL_NOTES[model] + ")",
             Ghost.LOOKS[look] + "  (" + LOOK_NOTES[look] + ")",
             OPACITIES[opacity] + "%" + (opacity == 0 ? "  (pure white)" : ""),
+            Ghost.COLOURS[colour],
             GLOW_NAMES[glow],
             largeCopy ? "Large  (3000 px, slower to save)" : "Small  (1500 px)",
+            liveNames.size() <= 1 ? "n/a" : liveNames.get(live) + (live == 0 ? "" : "  (viewfinder and JPEG)"),
+            skinModes.size() <= 1 ? "n/a" : skinLabel(skin),
             wbModes.isEmpty() ? "n/a" : wbLabel(wbMode, kelvin),
             kelvin + "K" + (WB_KELVIN.equals(wbMode) ? "" : "  (sets WB)"),
             droLabel(),
@@ -473,9 +505,123 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             sb.append(i == menuRow ? "<  " + values[i] + "  >" : "   " + values[i]).append('\n');
         }
         sb.append("\nup/down: row   left/right: change   Fn: close");
-        if (menuRow >= ROW_MODEL && menuRow <= ROW_GLOW && !ghostsOn) sb.append("\n(only used when Mode includes Ghosts)");
-        else if (menuRow <= ROW_SIZE) sb.append("\nEach shot gets a copy in GHOSTS (needs JPEG)");
+        if (menuRow >= ROW_MODEL && menuRow <= ROW_GLOW && !peopleOn) sb.append("\n(only used when People is on)");
+        else if (menuRow == ROW_LOOK && !ghostsOn) sb.append("\n(only used for Ghosts)");
+        else if (menuRow == ROW_LIVE || menuRow == ROW_SKIN) sb.append("\nSony's own effect: needs Quality set to JPEG (not RAW)");
+        else if (menuRow <= ROW_SIZE) sb.append(effectsOn() ? "\nEach shot gets a copy in GHOSTS (needs JPEG)"
+                : "\nPeople and Diffusion are off: shots are left as they are");
         picker.setText(sb.toString());
+    }
+
+    // ---------------- Sony's live effects ----------------
+
+    @SuppressWarnings("rawtypes")
+    private void readEffects(CameraEx.ParametersModifier m) {
+        liveNames.clear();
+        liveValues.clear();
+        liveNames.add("Off");
+        liveValues.add(new String[] {CameraEx.ParametersModifier.PICTURE_EFFECT_OFF, null});
+        try {
+            List effects = m.getSupportedPictureEffects();
+            log("picture effects " + effects);
+            if (effects != null && effects.contains(CameraEx.ParametersModifier.PICTURE_EFFECT_SOFT_FOCUS)) {
+                int lo = 1, hi = 3;
+                try {
+                    lo = m.getMinPictureEffectSoftFocusEffectLevel();
+                    hi = m.getMaxPictureEffectSoftFocusEffectLevel();
+                } catch (Throwable t) {
+                    log("soft focus levels failed: " + t);
+                }
+                for (int lv = lo; lv <= hi; lv++) {
+                    liveNames.add("Soft focus " + lv);
+                    liveValues.add(new String[] {CameraEx.ParametersModifier.PICTURE_EFFECT_SOFT_FOCUS, String.valueOf(lv)});
+                }
+            }
+            if (effects != null && effects.contains(CameraEx.ParametersModifier.PICTURE_EFFECT_SOFT_HIGH_KEY)) {
+                List tints = null;
+                try {
+                    tints = m.getSupportedPictureEffectSoftHighKeyEffects();
+                } catch (Throwable t) {
+                    log("soft high-key tints failed: " + t);
+                }
+                if (tints == null || tints.isEmpty()) {
+                    liveNames.add("Soft high-key");
+                    liveValues.add(new String[] {CameraEx.ParametersModifier.PICTURE_EFFECT_SOFT_HIGH_KEY, null});
+                } else {
+                    for (Object o : tints) {
+                        String tint = o.toString();
+                        liveNames.add("Soft high-key " + tint);
+                        liveValues.add(new String[] {CameraEx.ParametersModifier.PICTURE_EFFECT_SOFT_HIGH_KEY, tint});
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            log("picture effects failed: " + t);
+        }
+        skinModes.clear();
+        try {
+            List modes = m.getSupportedSoftSkinEffects();
+            log("soft skin " + modes);
+            if (modes != null) for (Object o : modes) skinModes.add(o.toString());
+        } catch (Throwable t) {
+            log("soft skin failed: " + t);
+        }
+    }
+
+    /** Sets the chosen live effect; with tell, says so (or why it didn't take). */
+    private void applyLive(boolean tell) {
+        if (camera == null || liveValues.isEmpty()) return;
+        String[] v = liveValues.get(Math.min(live, liveValues.size() - 1));
+        try {
+            Camera.Parameters p = camera.createEmptyParameters();
+            CameraEx.ParametersModifier m = camera.createParametersModifier(p);
+            m.setPictureEffect(v[0]);
+            if (CameraEx.ParametersModifier.PICTURE_EFFECT_SOFT_FOCUS.equals(v[0])) {
+                m.setPictureEffectSoftFocusEffectLevel(Integer.parseInt(v[1]));
+            } else if (CameraEx.ParametersModifier.PICTURE_EFFECT_SOFT_HIGH_KEY.equals(v[0]) && v[1] != null) {
+                m.setPictureEffectSoftHighKeyEffect(v[1]);
+            }
+            camera.getNormalCamera().setParameters(p);
+            String now = camera.createParametersModifier(camera.getNormalCamera().getParameters()).getPictureEffect();
+            log("live effect " + liveNames.get(live) + " -> camera reports " + now);
+            if (tell && !v[0].equals(now)) showMessage("The camera refused it: set Quality to JPEG (picture effects don't work with RAW)");
+        } catch (Throwable t) {
+            log("live effect failed: " + t);
+            if (tell) showMessage("Live effect failed: " + t.getMessage());
+        }
+        refreshTopBar();
+    }
+
+    private void applySkin() {
+        if (camera == null || skinModes.size() <= 1 || !skinModes.contains(skin)) return;
+        try {
+            Camera.Parameters p = camera.createEmptyParameters();
+            camera.createParametersModifier(p).setSoftSkinEffect(skin);
+            camera.getNormalCamera().setParameters(p);
+        } catch (Throwable t) {
+            log("soft skin failed: " + t);
+        }
+    }
+
+    /** Back to no picture effect and no soft skin, so the camera's own modes aren't left changed. */
+    private void clearSonyEffects() {
+        try {
+            Camera.Parameters p = camera.createEmptyParameters();
+            CameraEx.ParametersModifier m = camera.createParametersModifier(p);
+            if (live != 0) m.setPictureEffect(CameraEx.ParametersModifier.PICTURE_EFFECT_OFF);
+            if (skinModes.contains("off") && !"off".equals(skin)) m.setSoftSkinEffect("off");
+            camera.getNormalCamera().setParameters(p);
+        } catch (Throwable t) {
+            log("clear effects failed: " + t);
+        }
+    }
+
+    private static String skinLabel(String s) {
+        if ("off".equals(s)) return "Off";
+        if ("low".equals(s)) return "Low";
+        if ("mid".equals(s)) return "Mid";
+        if ("high".equals(s)) return "High";
+        return s;
     }
 
     // ---------------- white balance and D-Range ----------------
@@ -764,6 +910,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         File jpeg = newestJpeg(new File(Environment.getExternalStorageDirectory(), "DCIM"));
         boolean fresh = jpeg != null && !jpeg.equals(knownJpeg);
         knownJpeg = jpeg;
+        if (!effectsOn()) return;
         if (fresh) {
             ghoster.add(jpeg, options());
         } else {
@@ -771,14 +918,19 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         }
     }
 
+    private boolean effectsOn() {
+        return people != Ghoster.PEOPLE_OFF || diffusion > 0;
+    }
+
     private Ghoster.Options options() {
         Ghoster.Options opt = new Ghoster.Options();
         opt.modelSize = MODEL_SIZES[model];
         opt.glow = glow;
         opt.sample = largeCopy ? 2 : 4;
-        opt.ghosts = mode != MODE_DIFFUSION;
-        opt.diffusion = mode == MODE_GHOSTS ? 0 : diffusion;
+        opt.people = people;
+        opt.diffusion = diffusion;
         opt.look = look;
+        opt.colour = colour;
         opt.opacity = OPACITIES[opacity] / 100f;
         return opt;
     }
@@ -965,8 +1117,13 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
                     ? "This is a RAW file: Ghosts needs the JPEG" : "Can't find this photo's JPEG");
             return;
         }
+        if (!effectsOn()) {
+            showMessage("Pick People or Diffusion in the Fn menu first");
+            return;
+        }
         ghoster.add(f, options());
-        showMessage((mode == MODE_DIFFUSION ? "Diffusing " : "Ghosting ") + f.getName() + "...");
+        showMessage((people == Ghoster.PEOPLE_OFF ? "Diffusing " : people == Ghoster.PEOPLE_WIREFRAME ? "Wireframing " : "Ghosting ")
+                + f.getName() + "...");
     }
 
     /** dir 1 = older photo, -1 = newer. */
@@ -1297,10 +1454,13 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         }
         topBar.setVisibility(overlay || queued > 0 ? View.VISIBLE : View.GONE);
         String status = queued > 0 ? (stage.length() > 0 ? stage : "Waiting") + (queued > 1 ? " (" + queued + " queued)" : "") + "...    " : "";
-        String what = mode == MODE_DIFFUSION ? Diffusion.NAMES[diffusion]
-                : Ghost.LOOKS[look] + " " + OPACITIES[opacity] + "%   " + MODEL_NAMES[model]
-                        + (mode == MODE_BOTH ? "   + " + Diffusion.NAMES[diffusion] : "");
-        topBar.setText(status + "GHOSTS   " + what
+        String liveLabel = live > 0 && live < liveNames.size() ? "   [" + liveNames.get(live) + "]" : "";
+        String what = people == Ghoster.PEOPLE_GHOSTS ? Ghost.LOOKS[look] + " " + OPACITIES[opacity] + "%   " + MODEL_NAMES[model]
+                : people == Ghoster.PEOPLE_WIREFRAME ? "Wireframe " + Ghost.COLOURS[colour].toLowerCase() + "   " + MODEL_NAMES[model]
+                : "";
+        if (diffusion > 0) what += (what.length() > 0 ? "   + " : "") + Diffusion.NAMES[diffusion];
+        if (what.length() == 0) what = "off";
+        topBar.setText(status + "GHOSTS   " + what + liveLabel
                 + (queued > 0 ? "" : "   (Fn: menu)"));
     }
 
@@ -1392,8 +1552,11 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         model = clamp(prefs.getInt("model", 1), MODEL_SIZES.length);
         glow = clamp(prefs.getInt("glow", 2), GLOW_NAMES.length);
         largeCopy = prefs.getBoolean("largecopy", false);
-        mode = clamp(prefs.getInt("mode", MODE_GHOSTS), MODE_NAMES.length);
-        diffusion = Math.max(1, clamp(prefs.getInt("diffusion", 6), Diffusion.NAMES.length));
+        people = clamp(prefs.getInt("people", Ghoster.PEOPLE_OFF), PEOPLE_NAMES.length);
+        colour = clamp(prefs.getInt("colour", 0), Ghost.COLOURS.length);
+        liveKey = prefs.getString("live", "Off");
+        skin = prefs.getString("skin", "off");
+        diffusion = clamp(prefs.getInt("diffusion2", 0), Diffusion.NAMES.length);
         look = clamp(prefs.getInt("look", Ghost.ETHEREAL), Ghost.LOOKS.length);
         opacity = clamp(prefs.getInt("opacity", 1), OPACITIES.length);
         dro = Math.max(0, prefs.getInt("dro", 0));
@@ -1411,8 +1574,11 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
                 .putInt("model", model)
                 .putInt("glow", glow)
                 .putBoolean("largecopy", largeCopy)
-                .putInt("mode", mode)
-                .putInt("diffusion", diffusion)
+                .putInt("people", people)
+                .putInt("colour", colour)
+                .putString("live", liveKey)
+                .putString("skin", skin)
+                .putInt("diffusion2", diffusion)
                 .putInt("look", look)
                 .putInt("opacity", opacity)
                 .putInt("dro", dro)

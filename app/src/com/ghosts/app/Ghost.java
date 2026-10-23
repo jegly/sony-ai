@@ -16,6 +16,16 @@ package com.ghosts.app;
 public class Ghost {
     public static final int SOLID = 0, ETHEREAL = 1, DREAMY = 2;
     public static final String[] LOOKS = {"Solid", "Ethereal", "Dreamy"};
+    /** Colours of the figures' light. */
+    public static final String[] COLOURS = {"White", "Moonlight", "Warm", "Gold", "Rose", "Violet", "Cyan", "Green"};
+    private static final float[][] TINTS = {
+        {1f, 1f, 1f}, {0.82f, 0.9f, 1f}, {1f, 0.9f, 0.78f}, {1f, 0.83f, 0.5f}, {1f, 0.78f, 0.86f}, {0.85f, 0.76f, 1f},
+        {0.45f, 0.95f, 1f}, {0.45f, 1f, 0.55f}};
+
+    /** The light colour for a Colour setting, as r, g, b multipliers. */
+    public static float[] tint(int colour) {
+        return TINTS[Math.max(0, Math.min(TINTS.length - 1, colour))];
+    }
     /** Glow levels: 0 off, 1 soft, 2 strong. */
     public static final float[] GLOW = {0f, 0.6f, 1f};
 
@@ -28,8 +38,8 @@ public class Ghost {
     private final float[] bloomR, bloomG, bloomB; // soft bloom of the whole scene (Dreamy)
     private final float nearAmount, farAmount;
 
-    // tint of the wide halo: a faint cool white
-    private static final float FAR_R = 0.93f, FAR_G = 0.96f, FAR_B = 1f;
+    // tints: the figure and its tight glow, and the wide halo (white light gets a faint cool halo)
+    private final float figR, figG, figB, farR, farG, farB;
     // Dreamy scene: black lift (0..255), bloom strength, saturation kept
     private static final float LIFT = 22f, BLOOM = 0.5f, SATURATION = 0.78f;
 
@@ -38,11 +48,19 @@ public class Ghost {
      * @param opacity how solid the figures are, 0..1 (1 = pure white, lower lets the person show through)
      * @param preview the photo at mw x mh as packed RGB (only used by Dreamy; may be null)
      */
-    public Ghost(byte[] mask, int mw, int mh, int glowLevel, int look, float opacity, int[] preview) {
+    public Ghost(byte[] mask, int mw, int mh, int glowLevel, int look, float opacity, int colour, int[] preview) {
         this.mw = mw;
         this.mh = mh;
         this.look = Math.max(SOLID, Math.min(DREAMY, look));
         this.opacity = Math.max(0, Math.min(1, opacity));
+        float[] t = TINTS[Math.max(0, Math.min(TINTS.length - 1, colour))];
+        figR = t[0];
+        figG = t[1];
+        figB = t[2];
+        boolean white = colour <= 0;
+        farR = white ? 0.93f : t[0];
+        farG = white ? 0.96f : t[1];
+        farB = white ? 1f : t[2];
         float glow = GLOW[Math.max(0, Math.min(GLOW.length - 1, glowLevel))];
         float[] alpha = new float[mw * mh];
         for (int i = 0; i < alpha.length; i++) {
@@ -160,18 +178,18 @@ public class Ghost {
                 }
                 // wide halo, tight glow, then the figure itself, each screened over what's below
                 if (f > 0) {
-                    r = screen(r, f * FAR_R);
-                    gg = screen(gg, f * FAR_G);
-                    b = screen(b, f * FAR_B);
+                    r = screen(r, f * farR);
+                    gg = screen(gg, f * farG);
+                    b = screen(b, f * farB);
                 }
                 if (g > 0) {
-                    r = screen(r, g);
-                    gg = screen(gg, g);
-                    b = screen(b, g);
+                    r = screen(r, g * figR);
+                    gg = screen(gg, g * figG);
+                    b = screen(b, g * figB);
                 }
-                r = screen(r, s);
-                gg = screen(gg, s);
-                b = screen(b, s);
+                r = screen(r, s * figR);
+                gg = screen(gg, s * figG);
+                b = screen(b, s * figB);
                 rgb[base + x] = (c & 0xFF000000) | (clamp(r) << 16) | (clamp(gg) << 8) | clamp(b);
             }
         }
@@ -195,7 +213,7 @@ public class Ghost {
     }
 
     /** Three box blurs of radius r, close to a Gaussian. */
-    private static void gaussian(float[] m, int w, int h, int r) {
+    static void gaussian(float[] m, int w, int h, int r) {
         for (int pass = 0; pass < 3; pass++) blur(m, w, h, r);
     }
 

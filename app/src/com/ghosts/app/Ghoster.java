@@ -45,8 +45,10 @@ public class Ghoster {
         public int look = Ghost.ETHEREAL;
         /** How solid the figures are, 0..1. */
         public float opacity = 0.85f;
-        /** Find people and ghost them (otherwise only the diffusion filter is applied). */
-        public boolean ghosts = true;
+        /** Colour of the figures' light, see Ghost.COLOURS. */
+        public int colour = 0;
+        /** What to do with people: PEOPLE_OFF (only the diffusion filter), PEOPLE_GHOSTS or PEOPLE_WIREFRAME. */
+        public int people = PEOPLE_GHOSTS;
         /** Diffusion filter setting, see Diffusion.NAMES (0 = off). */
         public int diffusion = 0;
         /** Copy size as a fraction of the photo: 2 = half (Large), 4 = quarter (Small). */
@@ -55,6 +57,7 @@ public class Ghoster {
         public float confidence = 0.2f;
     }
 
+    public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2;
     private static final String MODEL = "yolo11n-seg.bin";
     private static final long MB = 1024 * 1024;
     private static final int STRIP = 64;
@@ -217,7 +220,7 @@ public class Ghoster {
             sb.append(mw).append('x').append(mh);
             byte[] mask = null;
             int people = -1;
-            if (opt.ghosts) {
+            if (opt.people != PEOPLE_OFF) {
                 stage("Finding people");
                 long tl = System.currentTimeMillis();
                 if (model[0] == null) model[0] = new Yseg(assets, MODEL);
@@ -248,20 +251,29 @@ public class Ghoster {
             int[] ppx = new int[px.length];
             for (int i = 0; i < index.length; i++) ppx[i] = px[index[i]];
             final Ghost ghost;
+            final Wireframe wire;
             if (people > 0) {
                 byte[] pmask = new byte[mask.length];
                 for (int i = 0; i < index.length; i++) pmask[i] = mask[index[i]];
-                ghost = new Ghost(pmask, qw, qh, opt.glow, opt.look, opt.opacity, ppx);
+                if (opt.people == PEOPLE_WIREFRAME) {
+                    ghost = null;
+                    wire = new Wireframe(pmask, qw, qh, opt.opacity, opt.glow, Ghost.tint(opt.colour));
+                } else {
+                    ghost = new Ghost(pmask, qw, qh, opt.glow, opt.look, opt.opacity, opt.colour, ppx);
+                    wire = null;
+                }
             } else {
                 ghost = null;
+                wire = null;
             }
             final Diffusion diffusion;
             if (opt.diffusion > 0) {
                 // the filter sits in front of the lens, so the ghosts' own light gets diffused too
                 int[] lit = ppx;
-                if (ghost != null) {
+                if (ghost != null || wire != null) {
                     lit = ppx.clone();
-                    ghost.apply(lit, 0, qh, qw, qh);
+                    if (ghost != null) ghost.apply(lit, 0, qh, qw, qh);
+                    if (wire != null) wire.apply(lit, 0, qh, qw, qh);
                 }
                 diffusion = new Diffusion(lit, qw, qh, opt.diffusion);
             } else {
@@ -270,6 +282,7 @@ public class Ghoster {
             Effect effect = new Effect() {
                 public void apply(int[] rows, int y, int count, int w, int h) {
                     if (ghost != null) ghost.apply(rows, y, count, w, h);
+                    if (wire != null) wire.apply(rows, y, count, w, h);
                     if (diffusion != null) diffusion.apply(rows, y, count, w, h);
                 }
             };
