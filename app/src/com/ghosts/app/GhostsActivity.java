@@ -74,17 +74,19 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
 
     // Fn menu: one row per setting
     private static final String[] MENU_ROWS = {"Effect", "Target", "Diffusion", "Model", "Look", "Face", "Amount", "Colour",
-            "Glow", "Copy size", "Live", "Soft skin", "WB", "Kelvin", "D-Range"};
+            "Glow", "Shots", "Copy size", "Live", "Soft skin", "WB", "Kelvin", "D-Range"};
     private static final int ROW_PEOPLE = 0, ROW_TARGET = 1, ROW_DIFFUSION = 2, ROW_MODEL = 3, ROW_LOOK = 4, ROW_FACE = 5,
-            ROW_OPACITY = 6, ROW_COLOUR = 7, ROW_GLOW = 8, ROW_SIZE = 9, ROW_LIVE = 10, ROW_SKIN = 11, ROW_WB = 12, ROW_KELVIN = 13,
-            ROW_DRO = 14;
+            ROW_OPACITY = 6, ROW_COLOUR = 7, ROW_GLOW = 8, ROW_SHOTS = 9, ROW_SIZE = 10, ROW_LIVE = 11, ROW_SKIN = 12, ROW_WB = 13,
+            ROW_KELVIN = 14, ROW_DRO = 15;
+    private static final int[] SHOT_COUNTS = {3, 5, 7, 9};
     private static final String[] TARGET_NAMES = {"People", "Vehicles", "Animals", "People + animals", "Everything"};
     private static final int[] VEHICLES = {1, 2, 3, 4, 5, 6, 7, 8}, ANIMALS = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
     private static final String[] PEOPLE_NAMES = {"Off", "Ghosts", "Wireframe", "Contours", "Face mesh", "Points", "Noir pop",
-            "Bokeh", "Rim light", "Glitch", "Thermal", "Comic", "Skeleton"};
+            "Bokeh", "Rim light", "Glitch", "Thermal", "Comic", "Skeleton", "Crowd remover", "Trails"};
     private static final String[] PEOPLE_NOTES = {"", "", "triangle mesh, face mesh on faces", "scan lines", "faces only, quicker",
             "point cloud", "colour on black and white film", "background out of focus", "backlit silhouettes, Colour sets the light",
-            "digital break-up", "heat camera", "pop art", "neon stick figures"};
+            "digital break-up", "heat camera", "pop art", "neon stick figures", "tripod, several shots: people vanish",
+            "tripod, several shots: ghost trails"};
     private static final int[] MODEL_SIZES = {320, 480, 640};
     private static final String[] MODEL_NAMES = {"Fast", "Normal", "Fine"};
     private static final String[] MODEL_NOTES = {"320 px, finds fewer people", "480 px", "640 px, slowest, finds the most people"};
@@ -104,6 +106,9 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     private int opacity = 1;
     private int colour = 0;
     private int target = 0;
+    private int shots = 1;
+    /** Shots taken so far for Crowd remover or Trails. */
+    private final List<File> burst = new ArrayList<File>();
     private int faceStyle = Mesh.FACE_MESH;
     // Sony's own effects, which show in the viewfinder and go into the camera's JPEG (JPEG quality only)
     private final List<String> liveNames = new ArrayList<String>();
@@ -214,6 +219,8 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
                                 + ", " + people + " people, " + millis + " ms: " + ghoster.lastTiming);
                         if (result == null) {
                             showMessage("No people found in " + source);
+                        } else if (people <= -2) {
+                            showMessage("Combined " + (-people) + " shots, saved: " + result.getName() + " (" + (millis / 1000) + " s)");
                         } else if (people <= 0) {
                             showMessage((people == 0 ? "No people, diffused copy saved: " : "Diffused copy saved: ")
                                     + result.getName() + " (" + (millis / 1000) + " s)");
@@ -254,6 +261,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
     protected void onPause() {
         super.onPause();
         pausing = true;
+        burst.clear();
         ghoster.cancel();
         handler.removeCallbacksAndMessages(null);
         savePrefs();
@@ -428,6 +436,11 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         switch (menuRow) {
             case ROW_PEOPLE:
                 people = (people + dir + PEOPLE_NAMES.length) % PEOPLE_NAMES.length;
+                burst.clear();
+                break;
+            case ROW_SHOTS:
+                shots = (shots + dir + SHOT_COUNTS.length) % SHOT_COUNTS.length;
+                burst.clear();
                 break;
             case ROW_DIFFUSION:
                 diffusion = (diffusion + dir + Diffusion.NAMES.length) % Diffusion.NAMES.length;
@@ -507,6 +520,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             OPACITIES[opacity] + "%" + (opacity == 0 ? "  (pure white)" : ""),
             Ghost.COLOURS[colour],
             GLOW_NAMES[glow],
+            SHOT_COUNTS[shots] + " shots" + (isMulti() ? "" : "  (for Crowd remover and Trails)"),
             largeCopy ? "Large  (3000 px, slower to save)" : "Small  (1500 px)",
             liveNames.size() <= 1 ? "n/a" : liveNames.get(live) + (live == 0 ? "" : "  (viewfinder and JPEG)"),
             skinModes.size() <= 1 ? "n/a" : skinLabel(skin),
@@ -930,11 +944,28 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         boolean fresh = jpeg != null && !jpeg.equals(knownJpeg);
         knownJpeg = jpeg;
         if (!effectsOn()) return;
-        if (fresh) {
+        if (fresh && isMulti()) {
+            burst.add(jpeg);
+            int need = SHOT_COUNTS[shots];
+            if (burst.size() < need) {
+                showMessage("Shot " + burst.size() + " of " + need + ": keep the camera still");
+            } else {
+                Ghoster.Options opt = options();
+                opt.burst = burst.toArray(new File[burst.size()]);
+                burst.clear();
+                ghoster.add(jpeg, opt);
+                showMessage("Combining " + need + " shots...");
+            }
+            refreshTopBar();
+        } else if (fresh) {
             ghoster.add(jpeg, options());
         } else {
             showMessage("Ghosts needs JPEG: set Quality to RAW & JPEG or JPEG");
         }
+    }
+
+    private boolean isMulti() {
+        return people == Ghoster.PEOPLE_CROWD || people == Ghoster.PEOPLE_TRAILS;
     }
 
     private byte[] classes() {
@@ -1149,6 +1180,10 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         }
         if (!effectsOn()) {
             showMessage("Pick an Effect or Diffusion in the Fn menu first");
+            return;
+        }
+        if (isMulti()) {
+            showMessage(PEOPLE_NAMES[people] + " works on new shots: take " + SHOT_COUNTS[shots] + " from a tripod");
             return;
         }
         ghoster.add(f, options());
@@ -1487,7 +1522,8 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         String what = people == Ghoster.PEOPLE_GHOSTS ? Ghost.LOOKS[look] + " " + OPACITIES[opacity] + "%   " + MODEL_NAMES[model]
                 : people != Ghoster.PEOPLE_OFF ? PEOPLE_NAMES[people] + " " + Ghost.COLOURS[colour].toLowerCase() + "   " + MODEL_NAMES[model]
                 : "";
-        if (diffusion > 0) what += (what.length() > 0 ? "   + " : "") + Diffusion.NAMES[diffusion];
+        if (isMulti()) what = PEOPLE_NAMES[people] + "   shot " + burst.size() + " of " + SHOT_COUNTS[shots] + " (use a tripod)";
+        else if (diffusion > 0) what += (what.length() > 0 ? "   + " : "") + Diffusion.NAMES[diffusion];
         if (what.length() == 0) what = "off";
         topBar.setText(status + "GHOSTS   " + what + liveLabel
                 + (queued > 0 ? "" : "   (Fn: menu)"));
@@ -1584,6 +1620,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         people = clamp(prefs.getInt("people", Ghoster.PEOPLE_OFF), PEOPLE_NAMES.length);
         colour = clamp(prefs.getInt("colour", 0), Ghost.COLOURS.length);
         target = clamp(prefs.getInt("target", 0), TARGET_NAMES.length);
+        shots = clamp(prefs.getInt("shots", 1), SHOT_COUNTS.length);
         faceStyle = clamp(prefs.getInt("face", 0), Mesh.FACE_STYLES.length);
         liveKey = prefs.getString("live", "Off");
         skin = prefs.getString("skin", "off");
@@ -1608,6 +1645,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
                 .putInt("people", people)
                 .putInt("colour", colour)
                 .putInt("target", target)
+                .putInt("shots", shots)
                 .putInt("face", faceStyle)
                 .putString("live", liveKey)
                 .putString("skin", skin)

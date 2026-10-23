@@ -53,6 +53,8 @@ public class Ghoster {
         public byte[] classes;
         /** Face style for meshed faces, see Mesh.FACE_STYLES. */
         public int faceStyle = Mesh.FACE_MESH;
+        /** For Crowd remover and Trails: the set of shots, oldest first (the job is keyed by the last one). */
+        public File[] burst;
         /** Diffusion filter setting, see Diffusion.NAMES (0 = off). */
         public int diffusion = 0;
         /** Copy size as a fraction of the photo: 2 = half (Large), 4 = quarter (Small). */
@@ -63,7 +65,7 @@ public class Ghoster {
 
     public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3, PEOPLE_FACES = 4,
             PEOPLE_POINTS = 5, PEOPLE_NOIR = 6, PEOPLE_BOKEH = 7, PEOPLE_RIM = 8, PEOPLE_GLITCH = 9, PEOPLE_THERMAL = 10,
-            PEOPLE_COMIC = 11, PEOPLE_SKELETON = 12;
+            PEOPLE_COMIC = 11, PEOPLE_SKELETON = 12, PEOPLE_CROWD = 13, PEOPLE_TRAILS = 14;
     /** Effects done by Scene, in Scene's order from PEOPLE_COLOUR_POP. */
     private static final int SCENE_FIRST = PEOPLE_NOIR, SCENE_LAST = PEOPLE_COMIC;
     private static final String MODEL = "yolo11n-seg.bin";
@@ -137,7 +139,13 @@ public class Ghoster {
                 long t0 = System.currentTimeMillis();
                 try {
                     int[] people = new int[1];
-                    File result = ghost(next, opt, people, model);
+                    File result;
+                    if (opt.burst != null) {
+                        result = multi(opt.burst, opt);
+                        people[0] = -opt.burst.length;
+                    } else {
+                        result = ghost(next, opt, people, model);
+                    }
                     listener.onDone(next.getName(), result, people[0], System.currentTimeMillis() - t0);
                 } catch (Throwable t) {
                     if (!cancelled) listener.onFailed(next.getName(), t);
@@ -542,6 +550,137 @@ public class Ghoster {
         }
         double[] shifted = {m[0], m[1], m[2] - rx, m[3], m[4], m[5] - ry};
         return FaceMesh.warp(px, rw, rh, shifted, ow, oh);
+    }
+
+    /**
+     * Combines a set of shots (Crowd remover or Trails) into one copy, named after the last shot. Each shot
+     * is decoded once to a raw temporary file, then all of them are read back a strip at a time.
+     */
+    private File multi(File[] shots, Options opt) throws IOException {
+        for (File f : shots) waitUntilStable(f);
+        long t0 = System.currentTimeMillis();
+        outDir.mkdirs();
+        int n = shots.length;
+        File[] raws = new File[n];
+        int w = -1, h = -1, sample = opt.sample;
+        int[] rows = null;
+        try {
+            for (int i = 0; i < n; i++) {
+                if (cancelled) throw new IOException("cancelled");
+                stage("Reading shot " + (i + 1) + " of " + n);
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeFile(shots[i].getPath(), bounds);
+                Bitmap bm = i == 0 || sample == opt.sample ? decodeCopy(shots[i], bounds.outWidth, bounds.outHeight, sample) : null;
+                if (bm == null) {
+                    if (i == 0) sample = opt.sample * 2; // not enough memory: smaller copies for the whole set
+                    BitmapFactory.Options o = new BitmapFactory.Options();
+                    o.inSampleSize = sample;
+                    bm = BitmapFactory.decodeFile(shots[i].getPath(), o);
+                }
+                if (bm == null) throw new IOException("cannot decode " + shots[i].getName());
+                if (w < 0) {
+                    w = bm.getWidth();
+                    h = bm.getHeight();
+                    rows = new int[w * STRIP];
+                }
+                raws[i] = new File(outDir, "SHOT" + i + ".TMP");
+                OutputStream os = new BufferedOutputStream(new FileOutputStream(raws[i]), 64 * 1024);
+                byte[] line = new byte[w * 3];
+                try {
+                    for (int y = 0; y < h; y += STRIP) {
+                        int c = Math.min(STRIP, h - y);
+                        java.util.Arrays.fill(rows, 0);
+                        int bw = Math.min(w, bm.getWidth()), bh = Math.max(0, Math.min(c, bm.getHeight() - y));
+                        if (bh > 0) bm.getPixels(rows, 0, w, 0, y, bw, bh);
+                        for (int r = 0; r < c; r++) {
+                            for (int x = 0; x < w; x++) {
+                                int p = rows[r * w + x];
+                                line[3 * x] = (byte) (p >> 16);
+                                line[3 * x + 1] = (byte) (p >> 8);
+                                line[3 * x + 2] = (byte) p;
+                            }
+                            os.write(line);
+                        }
+                    }
+                } finally {
+                    os.close();
+                    bm.recycle();
+                }
+            }
+            long t1 = System.currentTimeMillis();
+            stage("Combining " + n + " shots");
+            MultiShot ms = new MultiShot(opt.people == PEOPLE_TRAILS ? MultiShot.TRAILS : MultiShot.CROWD, opt.opacity,
+                    Ghost.tint(opt.colour));
+            java.io.DataInputStream[] in = new java.io.DataInputStream[n];
+            Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            try {
+                for (int i = 0; i < n; i++) {
+                    in[i] = new java.io.DataInputStream(new java.io.BufferedInputStream(new FileInputStream(raws[i]), 64 * 1024));
+                }
+                int[][] frames = new int[n][w * STRIP];
+                byte[] line = new byte[w * 3];
+                for (int y = 0; y < h; y += STRIP) {
+                    if (cancelled) throw new IOException("cancelled");
+                    int c = Math.min(STRIP, h - y);
+                    for (int i = 0; i < n; i++) {
+                        for (int r = 0; r < c; r++) {
+                            in[i].readFully(line);
+                            for (int x = 0; x < w; x++) {
+                                frames[i][r * w + x] = 0xFF000000 | ((line[3 * x] & 255) << 16) | ((line[3 * x + 1] & 255) << 8)
+                                        | (line[3 * x + 2] & 255);
+                            }
+                        }
+                    }
+                    ms.combine(frames, c, w, rows);
+                    out.setPixels(rows, 0, w, 0, y, w, c);
+                }
+                for (java.io.DataInputStream d : in) if (d != null) d.close();
+                long t2 = System.currentTimeMillis();
+                stage("Saving copy");
+                if (!waitForCard()) throw new IOException("cancelled");
+                File last = shots[n - 1];
+                File tmp = new File(outDir, outName(last.getName()) + ".TMP");
+                File done = new File(outDir, outName(last.getName()) + ".JPG");
+                byte[] exif = null;
+                try {
+                    exif = Jpeg.readExif(new FileInputStream(last));
+                } catch (IOException ignored) {
+                }
+                boolean ok = false;
+                try {
+                    OutputStream os = new BufferedOutputStream(new FileOutputStream(tmp), 64 * 1024);
+                    try {
+                        os.write(0xFF);
+                        os.write(0xD8);
+                        if (exif != null) os.write(exif);
+                        out.compress(Bitmap.CompressFormat.JPEG, 92, new SkipStart(os));
+                    } finally {
+                        os.close();
+                    }
+                    ok = true;
+                } finally {
+                    if (!ok) tmp.delete();
+                }
+                done.delete();
+                if (!tmp.renameTo(done)) throw new IOException("could not rename " + tmp.getName());
+                lastTiming = n + " shots " + w + "x" + h + ": read " + (t1 - t0) + " ms, combine " + (t2 - t1) + " ms, save "
+                        + (System.currentTimeMillis() - t2) + " ms";
+                return done;
+            } finally {
+                for (java.io.DataInputStream d : in) {
+                    if (d != null) {
+                        try {
+                            d.close();
+                        } catch (IOException ignored) {
+                        }
+                    }
+                }
+                out.recycle();
+            }
+        } finally {
+            for (File f : raws) if (f != null) f.delete();
+        }
     }
 
     private static int countOn(byte[] flags) {
