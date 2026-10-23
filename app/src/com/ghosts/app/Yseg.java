@@ -24,6 +24,19 @@ public class Yseg {
         return nativeRun(handle, rgb, w, h, threads, conf, mask, timings);
     }
 
+    /** Boxes of the people found by the last run: x1 y1 x2 y2 score each, in model input pixels. */
+    public float[] boxes() {
+        return handle == 0 ? new float[0] : nativeBoxes(handle);
+    }
+
+    /** Runs a plain model (a face model) and returns all its outputs one after another. */
+    public float[] runRaw(byte[] rgb, int w, int h, int outputFloats) throws IOException {
+        if (handle == 0) throw new IOException("model was freed");
+        float[] out = new float[outputFloats];
+        nativeRunRaw(handle, rgb, w, h, out);
+        return out;
+    }
+
     public void free() {
         if (handle != 0) nativeFree(handle);
         handle = 0;
@@ -32,6 +45,10 @@ public class Yseg {
     private static native int nativeLoad(AssetManager assets, String name) throws IOException;
 
     private static native void nativeFree(int handle);
+
+    private static native float[] nativeBoxes(int handle);
+
+    private static native int nativeRunRaw(int handle, byte[] rgb, int w, int h, float[] out) throws IOException;
 
     private static native int nativeRun(int handle, byte[] rgb, int w, int h, int threads, float conf, byte[] mask,
             double[] timings) throws IOException;

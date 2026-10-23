@@ -1,0 +1,6 @@
+Ghosts includes these models, converted to its own format by tools/lower.py and tools/lower_tflite.py:
+
+- YOLO11n-seg by Ultralytics, AGPL-3.0 (https://github.com/ultralytics/ultralytics). Because of it, Ghosts
+  is distributed under the AGPL-3.0 as well.
+- MediaPipe face detector (BlazeFace short range) and face landmark model, and the face mesh edge list,
+  by Google, Apache-2.0 (https://github.com/google-ai-edge/mediapipe).

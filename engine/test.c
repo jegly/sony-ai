@@ -45,6 +45,9 @@ int main(int argc, char **argv) {
     unsigned char *mask = malloc(w * h);
     int n = yseg_people(m, 0.2f, 0.7f, mask, 300);
     printf("people %d\n", n);
+    float boxes[5 * 64];
+    int nb = n > 0 ? yseg_boxes(m, boxes, 64) : 0;
+    for (int i = 0; i < nb; i++) printf("box %.1f %.1f %.1f %.1f %.3f\n", boxes[5 * i], boxes[5 * i + 1], boxes[5 * i + 2], boxes[5 * i + 3], boxes[5 * i + 4]);
     fwrite(mask, 1, w * h, f);
     fclose(f);
     yseg_free(m);

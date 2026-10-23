@@ -37,6 +37,52 @@ JNIEXPORT void JNICALL Java_com_ghosts_app_Yseg_nativeFree(JNIEnv *env, jclass c
     yseg_free((YSeg *) (intptr_t) handle);
 }
 
+/* Boxes of the people found by the last run: x1 y1 x2 y2 score each, model input pixels. */
+JNIEXPORT jfloatArray JNICALL Java_com_ghosts_app_Yseg_nativeBoxes(JNIEnv *env, jclass cls, jint handle) {
+    float buf[5 * 300];
+    int n = yseg_boxes((YSeg *) (intptr_t) handle, buf, 300);
+    jfloatArray out = (*env)->NewFloatArray(env, n * 5);
+    if (out && n > 0) (*env)->SetFloatArrayRegion(env, out, 0, n * 5, buf);
+    return out;
+}
+
+/* Runs a plain model (no people step) and copies all its outputs, one after another, into out.
+ * Returns how many floats were written, or -1. */
+JNIEXPORT jint JNICALL Java_com_ghosts_app_Yseg_nativeRunRaw(JNIEnv *env, jclass cls, jint handle, jbyteArray jrgb,
+        jint w, jint h, jfloatArray jout) {
+    YSeg *m = (YSeg *) (intptr_t) handle;
+    if ((*env)->GetArrayLength(env, jrgb) < w * h * 3) {
+        throw_error(env, "buffer too small");
+        return -1;
+    }
+    unsigned char *rgb = malloc((size_t) w * h * 3);
+    if (!rgb) {
+        throw_error(env, "out of memory");
+        return -1;
+    }
+    (*env)->GetByteArrayRegion(env, jrgb, 0, w * h * 3, (jbyte *) rgb);
+    int ok = yseg_run(m, rgb, w, h, 1);
+    free(rgb);
+    if (ok != 0) {
+        throw_error(env, "out of memory running the model");
+        return -1;
+    }
+    jsize cap = (*env)->GetArrayLength(env, jout);
+    int off = 0;
+    for (int i = 0; i < yseg_num_outputs(m); i++) {
+        int c, hh, ww;
+        const float *d = yseg_output(m, i, &c, &hh, &ww);
+        int n = c * hh * ww;
+        if (off + n > cap) {
+            throw_error(env, "output buffer too small");
+            return -1;
+        }
+        (*env)->SetFloatArrayRegion(env, jout, off, n, d);
+        off += n;
+    }
+    return off;
+}
+
 /* Runs the model on rgb (w*h*3 bytes) and writes the people mask (w*h) into mask.
  * Returns the number of people. timings (9 doubles, may be null) gets ms per op type. */
 JNIEXPORT jint JNICALL Java_com_ghosts_app_Yseg_nativeRun(JNIEnv *env, jclass cls, jint handle, jbyteArray jrgb,

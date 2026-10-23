@@ -24,6 +24,10 @@ int yseg_num_outputs(YSeg *m);
  * were found, or -1 if out of memory. */
 int yseg_people(YSeg *m, float conf, float iou, unsigned char *mask, int max_people);
 
+/* After yseg_people: the people's boxes (x1 y1 x2 y2 score in input pixels, best first), up to max.
+ * Returns how many. */
+int yseg_boxes(YSeg *m, float *out, int max);
+
 /* Milliseconds spent in each op type during the last run, for tuning. Fills up to n values. */
 void yseg_timings(YSeg *m, double *ms, int n);
 

@@ -4,3 +4,5 @@ build/
 probe/assets/
 probe/libs/
 __pycache__/
+model/*.in.rgb
+model/*.ref.npz

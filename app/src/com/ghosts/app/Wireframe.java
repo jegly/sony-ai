@@ -48,7 +48,7 @@ public class Wireframe {
     }
 
     /** Distance (mask pixels) from each pixel to the nearest pixel on the other side, 3-4 chamfer; 0 for the side itself. */
-    private static float[] chamfer(boolean[] in, int w, int h, boolean measureInside) {
+    static float[] chamfer(boolean[] in, int w, int h, boolean measureInside) {
         float big = 1e6f;
         float[] d = new float[w * h];
         for (int i = 0; i < d.length; i++) d[i] = in[i] == measureInside ? big : 0;

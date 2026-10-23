@@ -47,7 +47,8 @@ public class Ghoster {
         public float opacity = 0.85f;
         /** Colour of the figures' light, see Ghost.COLOURS. */
         public int colour = 0;
-        /** What to do with people: PEOPLE_OFF (only the diffusion filter), PEOPLE_GHOSTS or PEOPLE_WIREFRAME. */
+        /** What to do with people: PEOPLE_OFF (only the diffusion filter), PEOPLE_GHOSTS, PEOPLE_WIREFRAME (a
+         * triangle mesh, with face meshes on faces) or PEOPLE_CONTOURS. */
         public int people = PEOPLE_GHOSTS;
         /** Diffusion filter setting, see Diffusion.NAMES (0 = off). */
         public int diffusion = 0;
@@ -57,7 +58,7 @@ public class Ghoster {
         public float confidence = 0.2f;
     }
 
-    public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2;
+    public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3;
     private static final String MODEL = "yolo11n-seg.bin";
     private static final long MB = 1024 * 1024;
     private static final int STRIP = 64;
@@ -111,7 +112,7 @@ public class Ghoster {
 
     /** Runs on the worker thread; the model belongs to this run, so a later worker never shares it. */
     private void loop() {
-        Yseg[] model = new Yseg[1];
+        Yseg[] model = new Yseg[3]; // people, face detector, face landmarks
         try {
             while (true) {
                 File next;
@@ -141,7 +142,7 @@ public class Ghoster {
                 }
             }
         } finally {
-            if (model[0] != null) model[0].free();
+            for (Yseg y : model) if (y != null) y.free();
         }
     }
 
@@ -250,30 +251,40 @@ public class Ghoster {
             int[] index = uprightIndex(mw, mh, deg);
             int[] ppx = new int[px.length];
             for (int i = 0; i < index.length; i++) ppx[i] = px[index[i]];
-            final Ghost ghost;
-            final Wireframe wire;
+            Ghost ghostV = null;
+            Wireframe wireV = null;
+            Mesh meshV = null;
             if (people > 0) {
                 byte[] pmask = new byte[mask.length];
                 for (int i = 0; i < index.length; i++) pmask[i] = mask[index[i]];
-                if (opt.people == PEOPLE_WIREFRAME) {
-                    ghost = null;
-                    wire = new Wireframe(pmask, qw, qh, opt.opacity, opt.glow, Ghost.tint(opt.colour));
+                if (opt.people == PEOPLE_CONTOURS) {
+                    wireV = new Wireframe(pmask, qw, qh, opt.opacity, opt.glow, Ghost.tint(opt.colour));
+                } else if (opt.people == PEOPLE_WIREFRAME) {
+                    long tm = System.currentTimeMillis();
+                    meshV = new Mesh(pmask, qw, qh, opt.opacity, opt.glow, Ghost.tint(opt.colour), src.getName().hashCode());
+                    sb.append(", mesh ").append(meshV.points()).append(" points in ").append(System.currentTimeMillis() - tm).append(" ms");
+                    try {
+                        sb.append(", ").append(addFaces(meshV, model, model[0].boxes(), mw, deg, full, src, opt.sample, qw));
+                    } catch (IOException e) {
+                        if (cancelled) throw e;
+                        sb.append(", faces failed: ").append(e.getMessage());
+                    }
                 } else {
-                    ghost = new Ghost(pmask, qw, qh, opt.glow, opt.look, opt.opacity, opt.colour, ppx);
-                    wire = null;
+                    ghostV = new Ghost(pmask, qw, qh, opt.glow, opt.look, opt.opacity, opt.colour, ppx);
                 }
-            } else {
-                ghost = null;
-                wire = null;
             }
+            final Ghost ghost = ghostV;
+            final Wireframe wire = wireV;
+            final Mesh mesh = meshV;
             final Diffusion diffusion;
             if (opt.diffusion > 0) {
                 // the filter sits in front of the lens, so the ghosts' own light gets diffused too
                 int[] lit = ppx;
-                if (ghost != null || wire != null) {
+                if (ghost != null || wire != null || mesh != null) {
                     lit = ppx.clone();
                     if (ghost != null) ghost.apply(lit, 0, qh, qw, qh);
                     if (wire != null) wire.apply(lit, 0, qh, qw, qh);
+                    if (mesh != null) mesh.apply(lit, 0, qh, qw, qh);
                 }
                 diffusion = new Diffusion(lit, qw, qh, opt.diffusion);
             } else {
@@ -283,6 +294,7 @@ public class Ghoster {
                 public void apply(int[] rows, int y, int count, int w, int h) {
                     if (ghost != null) ghost.apply(rows, y, count, w, h);
                     if (wire != null) wire.apply(rows, y, count, w, h);
+                    if (mesh != null) mesh.apply(rows, y, count, w, h);
                     if (diffusion != null) diffusion.apply(rows, y, count, w, h);
                 }
             };
@@ -311,6 +323,122 @@ public class Ghoster {
         } finally {
             if (full != null) full.recycle();
         }
+    }
+
+    /** Faces meshed per photo at most; each takes a few seconds on the camera. */
+    private static final int MAX_FACES = 4;
+    /** Smallest head crop worth looking in, in copy pixels (smaller faces wouldn't show a mesh anyway). */
+    private static final int MIN_HEAD = 48;
+    private FaceMesh faceMesh;
+
+    /**
+     * Looks for a face in the head area of each person and puts MediaPipe's face mesh on it. Crops come from
+     * the decoded copy (or regions of the file when the copy is streamed), turned upright for the models.
+     * Returns a note for the log.
+     */
+    private String addFaces(Mesh mesh, Yseg[] model, float[] boxes, int mw, int deg, Bitmap full, File src, int sample,
+            int qw) throws IOException {
+        if (boxes.length == 0) return "";
+        if (faceMesh == null) faceMesh = new FaceMesh(assets.open("facemesh.bin"));
+        long t0 = System.currentTimeMillis();
+        BitmapRegionDecoder dec = null;
+        int fw, fh; // the copy's size, in the file's own orientation
+        if (full != null) {
+            fw = full.getWidth();
+            fh = full.getHeight();
+        } else {
+            dec = BitmapRegionDecoder.newInstance(src.getPath(), false);
+            if (dec == null) return "no faces (cannot decode)";
+            fw = dec.getWidth() / sample;
+            fh = dec.getHeight() / sample;
+        }
+        boolean sideways = deg == 90 || deg == 270;
+        double su = (double) (sideways ? fh : fw) / mw; // upright copy pixels per model pixel
+        double[] t = uprightToFile(deg, fw, fh);
+        int found = 0, tried = 0;
+        try {
+            for (int i = 0; i + 4 < boxes.length && found < MAX_FACES; i += 5) {
+                if (cancelled) throw new IOException("cancelled");
+                float x1 = (float) (boxes[i] * su), y1 = (float) (boxes[i + 1] * su);
+                float x2 = (float) (boxes[i + 2] * su), y2 = (float) (boxes[i + 3] * su);
+                float side = Math.min(x2 - x1, y2 - y1) * 0.9f;
+                if (side < MIN_HEAD) continue;
+                tried++;
+                stage("Finding faces");
+                double[] cm = FaceMesh.squareCrop((x1 + x2) / 2 - side / 2, y1 - side * 0.05f, side, FaceMesh.DET_SIZE);
+                byte[] crop = crop(full, dec, sample, fw, fh, compose(t, cm), FaceMesh.DET_SIZE, FaceMesh.DET_SIZE);
+                if (model[1] == null) model[1] = new Yseg(assets, "face_detector.bin");
+                FaceMesh.Face f = FaceMesh.detect(model[1].runRaw(crop, FaceMesh.DET_SIZE, FaceMesh.DET_SIZE, FaceMesh.DET_FLOATS), 0.5f);
+                if (f == null) continue;
+                stage("Meshing faces");
+                double[] lm = FaceMesh.landmarkCrop(FaceMesh.toSource(f, cm));
+                double[] lmFile = compose(t, lm);
+                byte[] lcrop = crop(full, dec, sample, fw, fh, lmFile, FaceMesh.LM_SIZE, FaceMesh.LM_SIZE);
+                if (model[2] == null) model[2] = new Yseg(assets, "face_landmarks.bin");
+                float[] out = model[2].runRaw(lcrop, FaceMesh.LM_SIZE, FaceMesh.LM_SIZE, FaceMesh.LM_FLOATS);
+                if (FaceMesh.presence(out) < 0.5f) continue;
+                float[] pts = FaceMesh.landmarks(out, lmFile);
+                float toMask = (float) qw / fw;
+                for (int k = 0; k < pts.length; k++) pts[k] *= toMask;
+                mesh.addFace(pts, faceMesh);
+                found++;
+            }
+        } finally {
+            if (dec != null) dec.recycle();
+        }
+        return found + (found == 1 ? " face" : " faces") + " (" + tried + " heads looked at, "
+                + (System.currentTimeMillis() - t0) + " ms)";
+    }
+
+    /** Maps upright copy coordinates to the file's own orientation (continuous pixel coordinates). */
+    private static double[] uprightToFile(int deg, int fw, int fh) {
+        switch (deg) {
+            case 90: return new double[] {0, 1, 0, -1, 0, fh};
+            case 180: return new double[] {-1, 0, fw, 0, -1, fh};
+            case 270: return new double[] {0, -1, fw, 1, 0, 0};
+            default: return new double[] {1, 0, 0, 0, 1, 0};
+        }
+    }
+
+    /** t after m, both as 2x3 affine maps. */
+    private static double[] compose(double[] t, double[] m) {
+        return new double[] {
+            t[0] * m[0] + t[1] * m[3], t[0] * m[1] + t[1] * m[4], t[0] * m[2] + t[1] * m[5] + t[2],
+            t[3] * m[0] + t[4] * m[3], t[3] * m[1] + t[4] * m[4], t[3] * m[2] + t[4] * m[5] + t[5]};
+    }
+
+    /** A crop for a face model: only the pixels the map m (output -> copy pixels) touches are read. */
+    private static byte[] crop(Bitmap full, BitmapRegionDecoder dec, int sample, int fw, int fh, double[] m, int ow, int oh) {
+        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+        for (int k = 0; k < 4; k++) {
+            double x = (k & 1) * ow, y = (k >> 1) * oh;
+            double sx = m[0] * x + m[1] * y + m[2], sy = m[3] * x + m[4] * y + m[5];
+            minX = Math.min(minX, sx);
+            maxX = Math.max(maxX, sx);
+            minY = Math.min(minY, sy);
+            maxY = Math.max(maxY, sy);
+        }
+        int rx = Math.max(0, (int) Math.floor(minX) - 1), ry = Math.max(0, (int) Math.floor(minY) - 1);
+        int rx1 = Math.min(fw, (int) Math.ceil(maxX) + 1), ry1 = Math.min(fh, (int) Math.ceil(maxY) + 1);
+        if (rx1 <= rx || ry1 <= ry) return new byte[ow * oh * 3];
+        int rw = rx1 - rx, rh = ry1 - ry;
+        int[] px;
+        if (full != null) {
+            px = new int[rw * rh];
+            full.getPixels(px, 0, rw, rx, ry, rw, rh);
+        } else {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inSampleSize = sample;
+            Bitmap b = dec.decodeRegion(new Rect(rx * sample, ry * sample, rx1 * sample, ry1 * sample), o);
+            if (b == null) return new byte[ow * oh * 3];
+            rw = b.getWidth();
+            rh = b.getHeight();
+            px = new int[rw * rh];
+            b.getPixels(px, 0, rw, 0, 0, rw, rh);
+            b.recycle();
+        }
+        double[] shifted = {m[0], m[1], m[2] - rx, m[3], m[4], m[5] - ry};
+        return FaceMesh.warp(px, rw, rh, shifted, ow, oh);
     }
 
     private static int round32(float v) {

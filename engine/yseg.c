@@ -10,7 +10,9 @@
 #include <string.h>
 #include <time.h>
 
-enum { OP_CONV = 1, OP_ADD, OP_CONCAT, OP_SLICE, OP_MAXPOOL, OP_UP2, OP_CONVT2, OP_ATTN, OP_TYPES };
+enum { OP_CONV = 1, OP_ADD, OP_CONCAT, OP_SLICE, OP_MAXPOOL, OP_UP2, OP_CONVT2, OP_ATTN, OP_TCONV, OP_PRELU, OP_PAD, OP_MAXPOOL2,
+       OP_TYPES };
+enum { ACT_NONE = 0, ACT_SILU, ACT_RELU, ACT_RELU6 };
 
 #define MAX_INTS 24
 #define MAX_THREADS 8
@@ -38,6 +40,9 @@ struct YSeg {
     Op *ops;
     Tensor *t;
     int threads;
+    float in_scale, in_offset; /* the engine feeds rgb / 255 * in_scale + in_offset */
+    float *boxes; /* people found by the last yseg_people: x1 y1 x2 y2 score, input pixels */
+    int nboxes;
     double ms[OP_TYPES + 2];
 };
 
@@ -144,6 +149,7 @@ void yseg_free(YSeg *m) {
     }
     free(m->ops);
     free(m->t);
+    free(m->boxes);
     free(m->outputs);
     free(m);
 }
@@ -177,9 +183,11 @@ YSeg *yseg_load(const void *data, size_t len, char *err, int errlen) {
     m->nops = rd_int(&r);
     m->nout = rd_int(&r);
     m->reg_max = rd_int(&r);
-    rd_int(&r);
-    rd_int(&r);
-    if (version != 1 || m->ntensors <= 0 || m->nops <= 0 || m->nout != 10) {
+    int sc = rd_int(&r), of = rd_int(&r);
+    memcpy(&m->in_scale, &sc, 4);
+    memcpy(&m->in_offset, &of, 4);
+    if (sc == 0 && of == 0) m->in_scale = 1, m->in_offset = 0;
+    if (version != 1 || m->ntensors <= 0 || m->nops <= 0 || m->nout < 1 || m->nout > 64) {
         snprintf(err, errlen, "unsupported model (version %d, %d outputs)", version, m->nout);
         yseg_free(m);
         return NULL;
@@ -201,7 +209,7 @@ YSeg *yseg_load(const void *data, size_t len, char *err, int errlen) {
             return NULL;
         }
         for (int j = 0; j < op->n; j++) op->a[j] = rd_int(&r);
-        if (op->type == OP_CONV) {
+        if (op->type == OP_CONV || op->type == OP_TCONV) {
             int cin = op->a[2], cout = op->a[3], k = op->a[4], groups = op->a[7];
             size_t nw = (size_t) cout * (cin / groups) * k * k;
             float *w = rd_halfs(&r, nw);
@@ -238,6 +246,9 @@ YSeg *yseg_load(const void *data, size_t len, char *err, int errlen) {
             free(w);
             free(b);
             if (!op->ap) goto oom;
+        } else if (op->type == OP_PRELU) {
+            op->bias = rd_floats(&r, op->a[2]); /* alpha per channel */
+            if (!op->bias) goto oom;
         } else if (op->type < OP_CONV || op->type >= OP_TYPES) {
             snprintf(err, errlen, "unknown op type %d", op->type);
             yseg_free(m);
@@ -342,6 +353,15 @@ static inline float fast_exp(float x) {
 
 static inline float silu(float v) {
     return v / (1.0f + fast_exp(-v));
+}
+
+static inline float activate(float v, int act) {
+    switch (act) {
+        case ACT_SILU: return silu(v);
+        case ACT_RELU: return v > 0 ? v : 0;
+        case ACT_RELU6: return v < 0 ? 0 : v > 6 ? 6 : v;
+        default: return v;
+    }
 }
 
 typedef struct {
@@ -450,7 +470,7 @@ static void conv_part(void *ctx, int part, int parts) {
                         int pix = pix0 + c;
                         if (pix >= N) break;
                         float v = tmp[r * 4 + c] + bias;
-                        if (j->act) v = silu(v);
+                        if (j->act) v = activate(v, j->act);
                         if (j->scatter) {
                             /* CONVT2: row m = co*4 + dy*2 + dx, pixel = input (y, x) */
                             int co = m >> 2, dy = (m >> 1) & 1, dx = m & 1;
@@ -473,12 +493,14 @@ typedef struct {
     const Op *op;
     const Tensor *in;
     Tensor *out;
+    int pad;
 } DwJob;
 
 static void dw_part(void *ctx, int part, int parts) {
     DwJob *j = ctx;
     const Op *op = j->op;
-    int k = op->a[4], s = op->a[5], p = op->a[6], act = op->a[8];
+    int k = op->a[4], s = op->a[5], act = op->a[8];
+    int p = j->pad;
     int C = j->in->c, H = j->in->h, W = j->in->w, OH = j->out->h, OW = j->out->w;
     for (int c = part; c < C; c += parts) {
         const float *w = op->dw + c * k * k;
@@ -497,7 +519,7 @@ static void dw_part(void *ctx, int part, int parts) {
                         sum += w[ky * k + kx] * src[y * W + x];
                     }
                 }
-                dst[oy * OW + ox] = act ? silu(sum) : sum;
+                dst[oy * OW + ox] = activate(sum, act);
             }
         }
     }
@@ -611,10 +633,11 @@ int yseg_run(YSeg *m, const unsigned char *rgb, int w, int h, int threads) {
     }
     Tensor *in = &m->t[0];
     if (alloc_tensor(in, 3, h, w)) return -1;
+    float sc = m->in_scale / 255.0f, of = m->in_offset;
     for (int i = 0; i < w * h; i++) {
-        in->d[i] = rgb[i * 3] / 255.0f;
-        in->d[w * h + i] = rgb[i * 3 + 1] / 255.0f;
-        in->d[2 * w * h + i] = rgb[i * 3 + 2] / 255.0f;
+        in->d[i] = rgb[i * 3] * sc + of;
+        in->d[w * h + i] = rgb[i * 3 + 1] * sc + of;
+        in->d[2 * w * h + i] = rgb[i * 3 + 2] * sc + of;
     }
     for (int i = 0; i < m->nops; i++) {
         Op *op = &m->ops[i];
@@ -630,8 +653,88 @@ int yseg_run(YSeg *m, const unsigned char *rgb, int w, int h, int threads) {
                     parallel(threads, conv_part, &j);
                     if (j.failed) return -1;
                 } else {
-                    DwJob j = {op, x, y};
+                    DwJob j = {op, x, y, p};
                     parallel(threads, dw_part, &j);
+                }
+                break;
+            }
+            case OP_TCONV: {
+                /* TFLite padding: SAME gives ceil(in / stride) outputs, with the extra padding at the bottom/right */
+                Tensor *x = &m->t[a[0]], *y = &m->t[a[1]];
+                int k = a[4], s = a[5], same = a[6];
+                int oh = same ? (x->h + s - 1) / s : (x->h - k) / s + 1;
+                int ow = same ? (x->w + s - 1) / s : (x->w - k) / s + 1;
+                int p = 0;
+                if (same) {
+                    int total = (oh - 1) * s + k - x->h;
+                    p = total > 0 ? total / 2 : 0;
+                }
+                if (alloc_tensor(y, a[3], oh, ow)) return -1;
+                if (a[7] == 1) {
+                    ConvJob j = {op, x, y, k, s, p, a[8], 0, oh, ow, 0};
+                    parallel(threads, conv_part, &j);
+                    if (j.failed) return -1;
+                } else {
+                    DwJob j = {op, x, y, p};
+                    parallel(threads, dw_part, &j);
+                }
+                break;
+            }
+            case OP_PRELU: {
+                Tensor *x = &m->t[a[0]], *y = &m->t[a[1]];
+                if (alloc_tensor(y, x->c, x->h, x->w)) return -1;
+                size_t plane = (size_t) x->h * x->w;
+                for (int c = 0; c < x->c; c++) {
+                    float al = op->bias[c];
+                    const float *src = x->d + c * plane;
+                    float *dst = y->d + c * plane;
+                    for (size_t q = 0; q < plane; q++) dst[q] = src[q] >= 0 ? src[q] : src[q] * al;
+                }
+                break;
+            }
+            case OP_PAD: {
+                Tensor *x = &m->t[a[0]], *y = &m->t[a[1]];
+                int cb = a[2], ca = a[3], top = a[4], bottom = a[5], left = a[6], right = a[7];
+                int oh = x->h + top + bottom, ow = x->w + left + right;
+                if (alloc_tensor(y, x->c + cb + ca, oh, ow)) return -1;
+                memset(y->d, 0, sizeof(float) * (size_t) y->c * oh * ow);
+                for (int c = 0; c < x->c; c++) {
+                    for (int yy = 0; yy < x->h; yy++) {
+                        memcpy(y->d + ((size_t) (c + cb) * oh + yy + top) * ow + left, x->d + ((size_t) c * x->h + yy) * x->w,
+                               sizeof(float) * x->w);
+                    }
+                }
+                break;
+            }
+            case OP_MAXPOOL2: {
+                Tensor *x = &m->t[a[0]], *y = &m->t[a[1]];
+                int k = a[2], s = a[3], same = a[4];
+                int oh = same ? (x->h + s - 1) / s : (x->h - k) / s + 1;
+                int ow = same ? (x->w + s - 1) / s : (x->w - k) / s + 1;
+                int p = 0;
+                if (same) {
+                    int total = (oh - 1) * s + k - x->h;
+                    p = total > 0 ? total / 2 : 0;
+                }
+                if (alloc_tensor(y, x->c, oh, ow)) return -1;
+                for (int c = 0; c < x->c; c++) {
+                    const float *src = x->d + (size_t) c * x->h * x->w;
+                    float *dst = y->d + (size_t) c * oh * ow;
+                    for (int oy = 0; oy < oh; oy++) {
+                        for (int ox = 0; ox < ow; ox++) {
+                            float v = -1e30f;
+                            for (int ky = 0; ky < k; ky++) {
+                                int iy = oy * s - p + ky;
+                                if (iy < 0 || iy >= x->h) continue;
+                                for (int kx = 0; kx < k; kx++) {
+                                    int ix = ox * s - p + kx;
+                                    if (ix < 0 || ix >= x->w) continue;
+                                    if (src[iy * x->w + ix] > v) v = src[iy * x->w + ix];
+                                }
+                            }
+                            dst[oy * ow + ox] = v;
+                        }
+                    }
                 }
                 break;
             }
@@ -647,7 +750,8 @@ int yseg_run(YSeg *m, const unsigned char *rgb, int w, int h, int threads) {
                 Tensor *x = &m->t[a[0]], *x2 = &m->t[a[1]], *y = &m->t[a[2]];
                 if (alloc_tensor(y, x->c, x->h, x->w)) return -1;
                 size_t n = (size_t) x->c * x->h * x->w;
-                for (size_t k = 0; k < n; k++) y->d[k] = x->d[k] + x2->d[k];
+                int act = op->n >= 4 ? a[3] : ACT_NONE;
+                for (size_t k = 0; k < n; k++) y->d[k] = activate(x->d[k] + x2->d[k], act);
                 break;
             }
             case OP_CONCAT: {
@@ -716,6 +820,12 @@ const float *yseg_output(YSeg *m, int i, int *c, int *h, int *w) {
     return t->d;
 }
 
+int yseg_boxes(YSeg *m, float *out, int max) {
+    int n = m->nboxes < max ? m->nboxes : max;
+    if (n > 0) memcpy(out, m->boxes, sizeof(float) * 5 * n);
+    return n;
+}
+
 void yseg_timings(YSeg *m, double *ms, int n) {
     for (int i = 0; i < n && i < OP_TYPES; i++) ms[i] = m->ms[i];
 }
@@ -742,6 +852,7 @@ static float iou(const Det *a, const Det *b) {
 }
 
 int yseg_people(YSeg *m, float conf, float iou_max, unsigned char *mask, int max_people) {
+    if (m->nout != 10) return -1;
     float logit_min = logf(conf / (1 - conf));
     int R = m->reg_max;
     int total = 0;
@@ -801,6 +912,20 @@ int yseg_people(YSeg *m, float conf, float iou_max, unsigned char *mask, int max
 
     /* Each person's mask logits at the proto resolution (a quarter of the input), upsampled
      * bilinearly to the input size, cropped to the person's box there, then combined. */
+    free(m->boxes);
+    m->boxes = malloc(sizeof(float) * 5 * (kept > 0 ? kept : 1));
+    m->nboxes = 0;
+    if (m->boxes) {
+        for (int k = 0; k < kept; k++) {
+            float *b = m->boxes + 5 * k;
+            b[0] = dets[k].x1;
+            b[1] = dets[k].y1;
+            b[2] = dets[k].x2;
+            b[3] = dets[k].y2;
+            b[4] = dets[k].score;
+        }
+        m->nboxes = kept;
+    }
     Tensor *proto = &m->t[m->outputs[9]];
     int PH = proto->h, PW = proto->w, PN = PH * PW, NC = proto->c;
     int W = m->t[0].w, H = m->t[0].h;
