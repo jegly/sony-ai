@@ -2,26 +2,31 @@ package com.ghosts.app;
 
 /**
  * Effects that use the subject mask to treat the subjects and the rest of the scene differently:
- *   Colour pop - subjects in colour, the rest black and white.
- *   Bokeh      - the background thrown out of focus behind the subjects, highlights opening into soft discs.
- *   Spotlight  - the background falls into darkness, the subjects stay lit, with light spilling round them.
- *   Glitch     - subjects broken up digitally: colour channels pulled apart and slices knocked sideways.
- *   Thermal    - a heat camera: subjects glow hot, the scene stays cold.
- *   Halftone   - subjects printed as a grid of dots.
+ *   Noir pop  - the world in rich black and white film, the subjects in vivid colour.
+ *   Bokeh     - the background thrown out of focus, more so further from the subjects, highlights opening
+ *               into bright discs.
+ *   Rim light - backlit like a concert: the scene falls dark, the subjects become moody silhouettes with a
+ *               glowing coloured rim of light round their edges.
+ *   Glitch    - subjects broken up digitally: colour channels pulled apart and slices knocked sideways.
+ *   Thermal   - a heat camera: subjects glow hot, the scene stays cold.
+ *   Comic     - subjects drawn as pop art: flat bold colour, Ben-Day dots in the mid tones, an ink outline.
  *
  * Like the other looks it works on strips of the copy, from maps at the mask's small size (and, for Bokeh,
- * a blurred small copy of the photo). Plain Java (no Android classes) so it can be checked on a computer.
+ * a larger blurred copy of the photo). Plain Java (no Android classes) so it can be checked on a computer.
  */
 public class Scene {
-    public static final int COLOUR_POP = 0, BOKEH = 1, SPOTLIGHT = 2, GLITCH = 3, THERMAL = 4, HALFTONE = 5;
+    public static final int NOIR = 0, BOKEH = 1, RIM = 2, GLITCH = 3, THERMAL = 4, COMIC = 5;
 
     private final int kind, mw, mh;
     private final float amount;
     private final float[] alpha; // subjects, 0..1, feathered a little
-    private final float[] spill; // Spotlight: light spilling out round the subjects; Thermal: the body's warm core
-    private final float[] bgR, bgG, bgB; // Bokeh: the blurred background, linear light
+    private final float[] aux;   // Rim light: the rim; Thermal: the body's warm core; Bokeh: distance from subjects
+    private final float[] aux2;  // Rim light: the rim's glow
     private final float cr, cg, cb;
     private final int seed;
+    // Bokeh: two blur levels of the background at bw x bh, packed RGB
+    private final int[] blurNear, blurFar;
+    private final int bw, bh;
 
     private static final float[] TO_LINEAR = new float[256];
     private static final byte[] TO_SRGB = new byte[4097];
@@ -39,11 +44,11 @@ public class Scene {
     }
 
     /**
-     * @param mask    subject mask, mw x mh, same orientation as the copy
-     * @param preview the photo at mw x mh as packed RGB (used by Bokeh)
-     * @param amount  strength, 0..1
+     * @param mask   subject mask, mw x mh, same orientation as the copy
+     * @param big    for Bokeh: the photo at bigW x bigH (larger than the mask for a cleaner blur), packed RGB
+     * @param amount strength, 0..1
      */
-    public Scene(int kind, byte[] mask, int mw, int mh, int[] preview, float amount, float[] colour, int seed) {
+    public Scene(int kind, byte[] mask, int mw, int mh, int[] big, int bigW, int bigH, float amount, float[] colour, int seed) {
         this.kind = kind;
         this.mw = mw;
         this.mh = mh;
@@ -60,49 +65,92 @@ public class Scene {
             alpha[i] = a <= 0 ? 0 : a >= 1 ? 1 : a * a * (3 - 2 * a);
         }
         Ghost.gaussian(alpha, mw, mh, Math.max(1, Math.round(mw / 400f)));
-        if (kind == SPOTLIGHT) {
-            spill = alpha.clone();
-            Ghost.gaussian(spill, mw, mh, Math.max(2, Math.round(mw / 14f)));
+        float[] a1 = null, a2 = null;
+        if (kind == RIM) {
+            // the rim: the figure minus a shrunk copy of it, then a wide glow from the rim
+            float[] inner = alpha.clone();
+            Ghost.gaussian(inner, mw, mh, Math.max(1, Math.round(mw / 320f)));
+            a1 = new float[n];
+            for (int i = 0; i < n; i++) a1[i] = alpha[i] * (1 - smooth(0.8f, 0.99f, inner[i]));
+            a2 = alpha.clone();
+            Ghost.gaussian(a2, mw, mh, Math.max(2, Math.round(mw / 22f)));
+            for (int i = 0; i < n; i++) a2[i] = Math.min(1, a2[i] * 1.8f);
         } else if (kind == THERMAL) {
-            spill = alpha.clone();
-            Ghost.gaussian(spill, mw, mh, Math.max(2, Math.round(mw / 70f)));
-            for (int i = 0; i < n; i++) spill[i] = Math.min(1, spill[i] * spill[i] * 1.6f);
-        } else {
-            spill = null;
+            a1 = alpha.clone();
+            Ghost.gaussian(a1, mw, mh, Math.max(2, Math.round(mw / 70f)));
+            for (int i = 0; i < n; i++) a1[i] = Math.min(1, a1[i] * a1[i] * 1.6f);
+        } else if (kind == BOKEH) {
+            // further from the subjects means further out of focus
+            a1 = alpha.clone();
+            Ghost.gaussian(a1, mw, mh, Math.max(2, Math.round(mw / 12f)));
+            for (int i = 0; i < n; i++) a1[i] = 1 - Math.min(1, a1[i] * 2.2f);
         }
-        if (kind == BOKEH && preview != null) {
-            // normalised blur of the background alone, so the subjects don't bleed into it
-            bgR = new float[n];
-            bgG = new float[n];
-            bgB = new float[n];
-            float[] wgt = new float[n];
-            for (int i = 0; i < n; i++) {
-                int c = preview[i];
-                float lr = TO_LINEAR[(c >> 16) & 255], lg = TO_LINEAR[(c >> 8) & 255], lb = TO_LINEAR[c & 255];
-                // bright spots get extra light, so they open up into discs like a real lens
-                float mx = Math.max(lr, Math.max(lg, lb));
-                float boost = 1 + 6 * smooth(0.6f, 1f, mx);
-                float bw = 1 - Math.min(1, alpha[i] * 1.5f);
-                bgR[i] = lr * boost * bw;
-                bgG[i] = lg * boost * bw;
-                bgB[i] = lb * boost * bw;
-                wgt[i] = bw;
-            }
-            int r = Math.max(1, Math.round(mw * (0.004f + 0.016f * amount)));
-            for (float[] m : new float[][] {bgR, bgG, bgB, wgt}) Ghost.gaussian(m, mw, mh, r);
-            for (int i = 0; i < n; i++) {
-                float k = wgt[i] > 1e-4f ? 1 / wgt[i] : 0;
-                bgR[i] *= k;
-                bgG[i] *= k;
-                bgB[i] *= k;
-            }
+        aux = a1;
+        aux2 = a2;
+        if (kind == BOKEH && big != null) {
+            bw = bigW;
+            bh = bigH;
+            int[][] levels = bokehLevels(big, bigW, bigH);
+            blurNear = levels[0];
+            blurFar = levels[1];
         } else {
-            bgR = bgG = bgB = null;
+            bw = bh = 0;
+            blurNear = blurFar = null;
         }
     }
 
-    private int[] x0, x1;
-    private float[] fx;
+    /** Two blurs of the background alone (subjects masked out and filled in), highlights boosted into discs. */
+    private int[][] bokehLevels(int[] big, int w, int h) {
+        int n = w * h;
+        float[] wgt = new float[n];
+        for (int y = 0; y < h; y++) {
+            float sy = (y + 0.5f) * mh / h - 0.5f;
+            for (int x = 0; x < w; x++) {
+                float sx = (x + 0.5f) * mw / w - 0.5f;
+                wgt[y * w + x] = 1 - Math.min(1, sample(alpha, sx, sy, mw, mh) * 1.6f);
+            }
+        }
+        int rNear = Math.max(1, Math.round(w * (0.003f + 0.007f * amount)));
+        int rFar = Math.max(2, Math.round(w * (0.008f + 0.02f * amount)));
+        float[] wn = wgt.clone(), wf = wgt.clone();
+        Ghost.gaussian(wn, w, h, rNear);
+        Ghost.gaussian(wf, w, h, rFar);
+        int[] near = new int[n], far = new int[n];
+        float[] ch = new float[n], c2 = new float[n];
+        for (int c = 0; c < 3; c++) {
+            int shift = 16 - 8 * c;
+            for (int i = 0; i < n; i++) {
+                int p = big[i];
+                float l = TO_LINEAR[(p >> shift) & 255];
+                float mx = Math.max(TO_LINEAR[(p >> 16) & 255], Math.max(TO_LINEAR[(p >> 8) & 255], TO_LINEAR[p & 255]));
+                // bright spots get much more light, so they open up into discs like a real lens
+                ch[i] = l * (1 + 10 * smooth(0.55f, 1f, mx)) * wgt[i];
+            }
+            System.arraycopy(ch, 0, c2, 0, n);
+            Ghost.gaussian(ch, w, h, rNear);
+            Ghost.gaussian(c2, w, h, rFar);
+            for (int i = 0; i < n; i++) {
+                float vn = wn[i] > 1e-4f ? ch[i] / wn[i] : 0, vf = wf[i] > 1e-4f ? c2[i] / wf[i] : 0;
+                near[i] |= srgb(vn / (1 + vn * 0.2f)) << shift;
+                far[i] |= srgb(vf / (1 + vf * 0.2f)) << shift;
+            }
+        }
+        return new int[][] {near, far};
+    }
+
+    private static float sample(float[] m, float sx, float sy, int w, int h) {
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        int x0 = Math.min(w - 1, (int) sx), y0 = Math.min(h - 1, (int) sy);
+        int x1 = Math.min(w - 1, x0 + 1), y1 = Math.min(h - 1, y0 + 1);
+        float fx = sx - x0, fy = sy - y0;
+        float top = m[y0 * w + x0] + (m[y0 * w + x1] - m[y0 * w + x0]) * fx;
+        float bot = m[y1 * w + x0] + (m[y1 * w + x1] - m[y1 * w + x0]) * fx;
+        return top + (bot - top) * fy;
+    }
+
+    private int[] x0, x1, bx0, bx1;
+    private float[] fx, bfx;
     private int forWidth = -1;
     private int[] src = new int[0];
 
@@ -112,14 +160,12 @@ public class Scene {
             x0 = new int[w];
             x1 = new int[w];
             fx = new float[w];
-            for (int x = 0; x < w; x++) {
-                float sx = (x + 0.5f) * mw / w - 0.5f;
-                if (sx < 0) sx = 0;
-                int i = (int) sx;
-                if (i > mw - 1) i = mw - 1;
-                x0[x] = i;
-                x1[x] = Math.min(mw - 1, i + 1);
-                fx[x] = sx - i;
+            prepare(w, mw, x0, x1, fx);
+            if (bw > 0) {
+                bx0 = new int[w];
+                bx1 = new int[w];
+                bfx = new float[w];
+                prepare(w, bw, bx0, bx1, bfx);
             }
             forWidth = w;
         }
@@ -127,7 +173,7 @@ public class Scene {
             if (src.length < w * count) src = new int[w * count];
             System.arraycopy(rgb, 0, src, 0, w * count);
         }
-        float cell = Math.max(5, w / 75f); // halftone cell, copy pixels
+        float cell = Math.max(5, w / 85f); // comic dots, copy pixels
         int split = Math.max(2, Math.round(w * 0.009f * (0.4f + amount)));
         for (int row = 0; row < count; row++) {
             int yy = y + row;
@@ -138,7 +184,15 @@ public class Scene {
             float wy = sy - iy;
             int r0 = iy * mw, r1 = iy2 * mw;
             int base = row * w;
-            // glitch: rows fall into bands, some knocked sideways
+            int by0 = 0, by1 = 0;
+            float bwy = 0;
+            if (bw > 0) {
+                float bsy = (yy + 0.5f) * bh / h - 0.5f;
+                if (bsy < 0) bsy = 0;
+                by0 = Math.min(bh - 1, (int) bsy);
+                by1 = Math.min(bh - 1, by0 + 1);
+                bwy = bsy - by0;
+            }
             int shift = 0;
             boolean scan = false, swap = false;
             if (kind == GLITCH) {
@@ -157,34 +211,47 @@ public class Scene {
                 float r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
                 float lum = 0.299f * r + 0.587f * g + 0.114f * b;
                 switch (kind) {
-                    case COLOUR_POP: {
-                        float k = (1 - a) * amount; // how grey
-                        r += (lum - r) * k;
-                        g += (lum - g) * k;
-                        b += (lum - b) * k;
+                    case NOIR: {
+                        // background: black and white with a film S-curve (deep blacks, bright whites)
+                        float v = lum / 255f;
+                        float sv = v * v * (3 - 2 * v) * 0.85f + v * 0.15f;
+                        float gray = sv * 245;
+                        // subjects: a touch more colour
+                        float sat = 1.25f;
+                        float pr = lum + (r - lum) * sat, pg = lum + (g - lum) * sat, pb = lum + (b - lum) * sat;
+                        float k = (1 - a) * amount;
+                        r = pr + (gray - pr) * k;
+                        g = pg + (gray - pg) * k;
+                        b = pb + (gray - pb) * k;
                         break;
                     }
                     case BOKEH: {
-                        if (bgR == null || a > 0.999f) continue;
-                        float br = lerp2(bgR, a0, a1, b0, b1, wx, wy), bg = lerp2(bgG, a0, a1, b0, b1, wx, wy);
-                        float bb = lerp2(bgB, a0, a1, b0, b1, wx, wy);
-                        // tone the boosted highlights back into range, gently
-                        br = br / (1 + br * 0.15f);
-                        bg = bg / (1 + bg * 0.15f);
-                        bb = bb / (1 + bb * 0.15f);
-                        float lr = TO_LINEAR[(int) r] * a + br * (1 - a), lg = TO_LINEAR[(int) g] * a + bg * (1 - a);
-                        float lb = TO_LINEAR[(int) b] * a + bb * (1 - a);
-                        r = srgb(lr);
-                        g = srgb(lg);
-                        b = srgb(lb);
+                        if (blurNear == null || a > 0.999f) continue;
+                        float far = lerp2(aux, a0, a1, b0, b1, wx, wy);
+                        int q00 = by0 * bw + bx0[x], q01 = by0 * bw + bx1[x], q10 = by1 * bw + bx0[x], q11 = by1 * bw + bx1[x];
+                        float u = bfx[x];
+                        float nr = mixRgb(blurNear, q00, q01, q10, q11, u, bwy, 16), ng = mixRgb(blurNear, q00, q01, q10, q11, u, bwy, 8);
+                        float nb = mixRgb(blurNear, q00, q01, q10, q11, u, bwy, 0);
+                        float fr = mixRgb(blurFar, q00, q01, q10, q11, u, bwy, 16), fg = mixRgb(blurFar, q00, q01, q10, q11, u, bwy, 8);
+                        float fb = mixRgb(blurFar, q00, q01, q10, q11, u, bwy, 0);
+                        float br = nr + (fr - nr) * far, bg = ng + (fg - ng) * far, bb = nb + (fb - nb) * far;
+                        r = r * a + br * (1 - a);
+                        g = g * a + bg * (1 - a);
+                        b = b * a + bb * (1 - a);
                         break;
                     }
-                    case SPOTLIGHT: {
-                        float l = Math.max(a, lerp2(spill, a0, a1, b0, b1, wx, wy) * 0.75f);
-                        float k = 1 - amount * 0.9f * (1 - l);
+                    case RIM: {
+                        float rim = lerp2(aux, a0, a1, b0, b1, wx, wy), halo = lerp2(aux2, a0, a1, b0, b1, wx, wy);
+                        // the scene falls into darkness except the light spilling from behind the figures
+                        float dark = 1 - amount * 0.9f * (1 - halo * 0.45f);
+                        float k = dark + (0.32f - dark) * a; // the figures themselves: dark silhouettes
                         r *= k;
                         g *= k;
                         b *= k;
+                        float light = Math.min(1, rim * 1.15f + halo * 0.5f * (1 - a));
+                        r = 255 - (255 - r) * (1 - light * cr);
+                        g = 255 - (255 - g) * (1 - light * cg);
+                        b = 255 - (255 - b) * (1 - light * cb);
                         break;
                     }
                     case GLITCH: {
@@ -208,7 +275,7 @@ public class Scene {
                     }
                     case THERMAL: {
                         float v = lum / 255f;
-                        float core = lerp2(spill, a0, a1, b0, b1, wx, wy);
+                        float core = lerp2(aux, a0, a1, b0, b1, wx, wy);
                         float t = (0.08f + 0.32f * v) * (1 - a) + (0.46f + 0.26f * core + 0.28f * v) * a;
                         int heat = iron(t);
                         float hr = (heat >> 16) & 255, hg = (heat >> 8) & 255, hb = heat & 255;
@@ -217,24 +284,62 @@ public class Scene {
                         b += (hb - b) * amount;
                         break;
                     }
-                    case HALFTONE: {
+                    case COMIC: {
                         if (a < 0.01f) continue;
-                        // dot size follows the brightness; dots sit on a dark ground
-                        float cx = (float) Math.floor(x / cell) * cell + cell / 2, cy = (float) Math.floor(yy / cell) * cell + cell / 2;
-                        float d = (float) Math.sqrt((x + 0.5f - cx) * (x + 0.5f - cx) + (yy + 0.5f - cy) * (yy + 0.5f - cy));
-                        float rad = cell * 0.66f * (float) Math.sqrt(0.08f + 0.92f * lum / 255f);
-                        float dot = Math.max(0, Math.min(1, rad + 0.5f - d));
-                        float k = a * amount;
-                        float gr = 18 + 237 * dot;
-                        r += (gr * cr - r) * k;
-                        g += (gr * cg - g) * k;
-                        b += (gr * cb - b) * k;
+                        // flat, punchy colour in three tones
+                        float v = lum / 255f;
+                        float sat = 1.35f;
+                        float pr = lum + (r - lum) * sat, pg = lum + (g - lum) * sat, pb = lum + (b - lum) * sat;
+                        float mx = Math.max(1, Math.max(pr, Math.max(pg, pb)));
+                        float tone = v < 0.22f ? 0.35f : v < 0.55f ? 0.75f : 1f;
+                        float scale = 235 * tone / mx;
+                        pr *= scale;
+                        pg *= scale;
+                        pb *= scale;
+                        // Ben-Day dots over the middle tone, on a 45 degree grid
+                        if (v >= 0.22f && v < 0.55f) {
+                            float u = (x + yy) / (cell * 1.414f), t = (x - yy) / (cell * 1.414f);
+                            float du = u - (float) Math.floor(u) - 0.5f, dt = t - (float) Math.floor(t) - 0.5f;
+                            float d = (float) Math.sqrt(du * du + dt * dt) * cell * 1.414f;
+                            float dot = Math.max(0, Math.min(1, cell * 0.28f + 0.5f - d));
+                            pr *= 1 - 0.55f * dot;
+                            pg *= 1 - 0.55f * dot;
+                            pb *= 1 - 0.55f * dot;
+                        }
+                        // ink outline where the figure's edge is
+                        float edge = 1 - Math.abs(a - 0.5f) * 2;
+                        float ink = Math.max(0, Math.min(1, (edge - 0.35f) * 2.5f));
+                        pr *= 1 - ink;
+                        pg *= 1 - ink;
+                        pb *= 1 - ink;
+                        float k = Math.min(1, a * 1.6f) * amount;
+                        r += (pr - r) * k;
+                        g += (pg - g) * k;
+                        b += (pb - b) * k;
                         break;
                     }
                 }
                 rgb[base + x] = (c & 0xFF000000) | (clamp(r) << 16) | (clamp(g) << 8) | clamp(b);
             }
         }
+    }
+
+    private static void prepare(int w, int mw, int[] x0, int[] x1, float[] fx) {
+        for (int x = 0; x < w; x++) {
+            float sx = (x + 0.5f) * mw / w - 0.5f;
+            if (sx < 0) sx = 0;
+            int i = (int) sx;
+            if (i > mw - 1) i = mw - 1;
+            x0[x] = i;
+            x1[x] = Math.min(mw - 1, i + 1);
+            fx[x] = sx - i;
+        }
+    }
+
+    private static float mixRgb(int[] m, int a0, int a1, int b0, int b1, float wx, float wy, int shift) {
+        float p = (m[a0] >> shift) & 255, q = (m[a1] >> shift) & 255, s = (m[b0] >> shift) & 255, t = (m[b1] >> shift) & 255;
+        float top = p + (q - p) * wx, bot = s + (t - s) * wx;
+        return top + (bot - top) * wy;
     }
 
     /** "Iron" heat palette: black, violet, red, orange, yellow, white, for t in 0..1. */

@@ -19,14 +19,19 @@ public class SceneTest {
         Graphics2D g2 = small.createGraphics();
         g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
         g2.drawImage(src, 0, 0, mw, mh, null);
-        int[] preview = small.getRGB(0, 0, mw, mh, null, 0, mw);
+        int bw = Math.round(w * 0.4f), bh = Math.round(h * 0.4f);
+        BufferedImage bigImg = new BufferedImage(bw, bh, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g3 = bigImg.createGraphics();
+        g3.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g3.drawImage(src, 0, 0, bw, bh, null);
+        int[] big = bigImg.getRGB(0, 0, bw, bh, null, 0, bw);
         String out = a[4].replace(".jpg", "");
         for (int v = 5; v < a.length; v++) {
             String[] p = a[v].split(":");
             BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
             img.getGraphics().drawImage(src, 0, 0, null);
             long t0 = System.nanoTime();
-            Scene s = new Scene(Integer.parseInt(p[0]), mask, mw, mh, preview, Float.parseFloat(p[1]), Ghost.tint(Integer.parseInt(p[2])), 11);
+            Scene s = new Scene(Integer.parseInt(p[0]), mask, mw, mh, big, bw, bh, Float.parseFloat(p[1]), Ghost.tint(Integer.parseInt(p[2])), 11);
             int[] rows = new int[w * 64];
             for (int y = 0; y < h; y += 64) {
                 int n = Math.min(64, h - y);

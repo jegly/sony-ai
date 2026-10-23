@@ -62,10 +62,10 @@ public class Ghoster {
     }
 
     public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3, PEOPLE_FACES = 4,
-            PEOPLE_POINTS = 5, PEOPLE_COLOUR_POP = 6, PEOPLE_BOKEH = 7, PEOPLE_SPOTLIGHT = 8, PEOPLE_GLITCH = 9, PEOPLE_THERMAL = 10,
-            PEOPLE_HALFTONE = 11, PEOPLE_SKELETON = 12;
+            PEOPLE_POINTS = 5, PEOPLE_NOIR = 6, PEOPLE_BOKEH = 7, PEOPLE_RIM = 8, PEOPLE_GLITCH = 9, PEOPLE_THERMAL = 10,
+            PEOPLE_COMIC = 11, PEOPLE_SKELETON = 12;
     /** Effects done by Scene, in Scene's order from PEOPLE_COLOUR_POP. */
-    private static final int SCENE_FIRST = PEOPLE_COLOUR_POP, SCENE_LAST = PEOPLE_HALFTONE;
+    private static final int SCENE_FIRST = PEOPLE_NOIR, SCENE_LAST = PEOPLE_COMIC;
     private static final String MODEL = "yolo11n-seg.bin";
     private static final long MB = 1024 * 1024;
     private static final int STRIP = 64;
@@ -316,7 +316,18 @@ public class Ghoster {
                         }
                     }
                 } else if (opt.people >= SCENE_FIRST && opt.people <= SCENE_LAST) {
-                    sceneV = new Scene(opt.people - SCENE_FIRST, pmask, qw, qh, ppx, opt.opacity, Ghost.tint(opt.colour),
+                    // Bokeh blurs a larger copy of the photo than the mask, for a cleaner background
+                    int[] big = ppx;
+                    int bigW = qw, bigH = qh;
+                    if (opt.people == PEOPLE_BOKEH && full != null) {
+                        bigW = Math.max(qw, Math.round(full.getWidth() * 0.4f));
+                        bigH = Math.max(qh, Math.round(full.getHeight() * 0.4f));
+                        Bitmap sb2 = Bitmap.createScaledBitmap(full, bigW, bigH, true);
+                        big = new int[bigW * bigH];
+                        sb2.getPixels(big, 0, bigW, 0, 0, bigW, bigH);
+                        if (sb2 != full) sb2.recycle();
+                    }
+                    sceneV = new Scene(opt.people - SCENE_FIRST, pmask, qw, qh, big, bigW, bigH, opt.opacity, Ghost.tint(opt.colour),
                             src.getName().hashCode());
                 } else {
                     ghostV = new Ghost(pmask, qw, qh, opt.glow, opt.look, opt.opacity, opt.colour, ppx);
