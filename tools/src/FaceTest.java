@@ -35,8 +35,32 @@ public class FaceTest {
         byte[] mask = run("yolo11n-seg.bin", rgb, mw, mh, boxes, 0);
         byte[] m = new byte[mw * mh];
         System.arraycopy(mask, mask.length - mw * mh, m, 0, mw * mh);
-        Mesh mesh = new Mesh(m, mw, mh, 0.85f, 2, Ghost.tint(Integer.parseInt(a[7])), 7);
+        boolean facesOnly = a.length > 8 && a[8].equals("faces");
+        Mesh mesh = facesOnly ? new Mesh(new byte[mw * mh], mw, mh, 0, 2, Ghost.tint(Integer.parseInt(a[7])), 7)
+                : new Mesh(m, mw, mh, 0.85f, 2, Ghost.tint(Integer.parseInt(a[7])), 7);
         float sx = (float) w / mw;
+        if (facesOnly) {
+            mesh.setFaceDim(0.85f * 0.5f);
+            List<FaceMesh.Face> faces = new ArrayList<FaceMesh.Face>();
+            List<double[]> tiles = FaceMesh.tiles(w, h);
+            for (double[] cm : tiles) {
+                float[] det = floats(run("face_detector.bin", FaceMesh.warp(src, w, h, cm, 128, 128), 128, 128, null, FaceMesh.DET_FLOATS));
+                FaceMesh.Face f = FaceMesh.detect(det, 0.6f);
+                if (f != null) faces.add(FaceMesh.toSource(f, cm));
+            }
+            List<FaceMesh.Face> kept = FaceMesh.merge(faces, 6);
+            System.out.println(tiles.size() + " squares, " + faces.size() + " hits, " + kept.size() + " faces");
+            for (FaceMesh.Face fs : kept) {
+                double[] lm = FaceMesh.landmarkCrop(fs);
+                float[] out = floats(run("face_landmarks.bin", FaceMesh.warp(src, w, h, lm, 256, 256), 256, 256, null, FaceMesh.LM_FLOATS));
+                System.out.printf("  face %.0fx%.0f at %.0f,%.0f presence %.2f%n", fs.w, fs.h, fs.cx, fs.cy, FaceMesh.presence(out));
+                if (FaceMesh.presence(out) < 0.5f) continue;
+                float[] pts = FaceMesh.landmarks(out, lm);
+                for (int i = 0; i < pts.length; i++) pts[i] /= sx;
+                mesh.addFace(pts, fm);
+            }
+            boxes.clear();
+        }
         for (float[] b : boxes) {
             float x1 = b[0] * sx, y1 = b[1] * sx, x2 = b[2] * sx, y2 = b[3] * sx;
             float side = Math.min(x2 - x1, y2 - y1) * 0.9f;

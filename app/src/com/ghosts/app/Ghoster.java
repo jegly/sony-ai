@@ -58,7 +58,7 @@ public class Ghoster {
         public float confidence = 0.2f;
     }
 
-    public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3;
+    public static final int PEOPLE_OFF = 0, PEOPLE_GHOSTS = 1, PEOPLE_WIREFRAME = 2, PEOPLE_CONTOURS = 3, PEOPLE_FACES = 4;
     private static final String MODEL = "yolo11n-seg.bin";
     private static final long MB = 1024 * 1024;
     private static final int STRIP = 64;
@@ -221,7 +221,7 @@ public class Ghoster {
             sb.append(mw).append('x').append(mh);
             byte[] mask = null;
             int people = -1;
-            if (opt.people != PEOPLE_OFF) {
+            if (opt.people != PEOPLE_OFF && opt.people != PEOPLE_FACES) {
                 stage("Finding people");
                 long tl = System.currentTimeMillis();
                 if (model[0] == null) model[0] = new Yseg(assets, MODEL);
@@ -240,6 +240,16 @@ public class Ghoster {
             rgb = null;
             sb.append(", decode ").append(t1 - t0).append(" ms, shrink ").append(t2 - t1).append(" ms");
             peopleOut[0] = people;
+            Mesh faceOnly = null;
+            if (opt.people == PEOPLE_FACES) {
+                // faces only: no people model, the face detector scans the whole frame
+                int qw0 = sideways ? mh : mw, qh0 = sideways ? mw : mh;
+                faceOnly = new Mesh(new byte[qw0 * qh0], qw0, qh0, 0, opt.glow, Ghost.tint(opt.colour), 0);
+                faceOnly.setFaceDim(opt.opacity * 0.5f);
+                sb.append(", ").append(addFaces(faceOnly, model, null, mw, deg, full, src, opt.sample, qw0));
+                people = faceOnly.faces();
+            }
+            peopleOut[0] = people;
             if (people == 0 && opt.diffusion == 0) {
                 lastTiming = sb.toString();
                 return null;
@@ -253,8 +263,8 @@ public class Ghoster {
             for (int i = 0; i < index.length; i++) ppx[i] = px[index[i]];
             Ghost ghostV = null;
             Wireframe wireV = null;
-            Mesh meshV = null;
-            if (people > 0) {
+            Mesh meshV = faceOnly;
+            if (people > 0 && faceOnly == null) {
                 byte[] pmask = new byte[mask.length];
                 for (int i = 0; i < index.length; i++) pmask[i] = mask[index[i]];
                 if (opt.people == PEOPLE_CONTOURS) {
@@ -338,7 +348,7 @@ public class Ghoster {
      */
     private String addFaces(Mesh mesh, Yseg[] model, float[] boxes, int mw, int deg, Bitmap full, File src, int sample,
             int qw) throws IOException {
-        if (boxes.length == 0) return "";
+        if (boxes != null && boxes.length == 0) return "";
         if (faceMesh == null) faceMesh = new FaceMesh(assets.open("facemesh.bin"));
         long t0 = System.currentTimeMillis();
         BitmapRegionDecoder dec = null;
@@ -357,6 +367,28 @@ public class Ghoster {
         double[] t = uprightToFile(deg, fw, fh);
         int found = 0, tried = 0;
         try {
+            if (boxes == null) {
+                // scan the whole frame in squares, then mesh the faces found
+                java.util.List<FaceMesh.Face> faces = new java.util.ArrayList<FaceMesh.Face>();
+                java.util.List<double[]> tiles = FaceMesh.tiles(sideways ? fh : fw, sideways ? fw : fh);
+                stage("Finding faces");
+                for (double[] cm : tiles) {
+                    if (cancelled) throw new IOException("cancelled");
+                    byte[] crop = crop(full, dec, sample, fw, fh, compose(t, cm), FaceMesh.DET_SIZE, FaceMesh.DET_SIZE);
+                    if (model[1] == null) model[1] = new Yseg(assets, "face_detector.bin");
+                    FaceMesh.Face f = FaceMesh.detect(model[1].runRaw(crop, FaceMesh.DET_SIZE, FaceMesh.DET_SIZE, FaceMesh.DET_FLOATS), 0.6f);
+                    tried++;
+                    if (f != null) faces.add(FaceMesh.toSource(f, cm));
+                }
+                for (FaceMesh.Face fs : FaceMesh.merge(faces, MAX_FACES + 2)) {
+                    if (cancelled) throw new IOException("cancelled");
+                    if (Math.max(fs.w, fs.h) < MIN_HEAD / 3) continue;
+                    stage("Meshing faces");
+                    if (meshFace(mesh, model, fs, t, full, dec, sample, fw, fh, qw)) found++;
+                }
+                return found + (found == 1 ? " face" : " faces") + " (" + tried + " squares scanned, "
+                        + (System.currentTimeMillis() - t0) + " ms)";
+            }
             for (int i = 0; i + 4 < boxes.length && found < MAX_FACES; i += 5) {
                 if (cancelled) throw new IOException("cancelled");
                 float x1 = (float) (boxes[i] * su), y1 = (float) (boxes[i + 1] * su);
@@ -371,23 +403,28 @@ public class Ghoster {
                 FaceMesh.Face f = FaceMesh.detect(model[1].runRaw(crop, FaceMesh.DET_SIZE, FaceMesh.DET_SIZE, FaceMesh.DET_FLOATS), 0.5f);
                 if (f == null) continue;
                 stage("Meshing faces");
-                double[] lm = FaceMesh.landmarkCrop(FaceMesh.toSource(f, cm));
-                double[] lmFile = compose(t, lm);
-                byte[] lcrop = crop(full, dec, sample, fw, fh, lmFile, FaceMesh.LM_SIZE, FaceMesh.LM_SIZE);
-                if (model[2] == null) model[2] = new Yseg(assets, "face_landmarks.bin");
-                float[] out = model[2].runRaw(lcrop, FaceMesh.LM_SIZE, FaceMesh.LM_SIZE, FaceMesh.LM_FLOATS);
-                if (FaceMesh.presence(out) < 0.5f) continue;
-                float[] pts = FaceMesh.landmarks(out, lmFile);
-                float toMask = (float) qw / fw;
-                for (int k = 0; k < pts.length; k++) pts[k] *= toMask;
-                mesh.addFace(pts, faceMesh);
-                found++;
+                if (meshFace(mesh, model, FaceMesh.toSource(f, cm), t, full, dec, sample, fw, fh, qw)) found++;
             }
         } finally {
             if (dec != null) dec.recycle();
         }
         return found + (found == 1 ? " face" : " faces") + " (" + tried + " heads looked at, "
                 + (System.currentTimeMillis() - t0) + " ms)";
+    }
+
+    /** Runs the landmark model on one face (upright copy pixels) and adds its mesh; false if it isn't a face after all. */
+    private boolean meshFace(Mesh mesh, Yseg[] model, FaceMesh.Face fs, double[] t, Bitmap full, BitmapRegionDecoder dec,
+            int sample, int fw, int fh, int qw) throws IOException {
+        double[] lmFile = compose(t, FaceMesh.landmarkCrop(fs));
+        byte[] lcrop = crop(full, dec, sample, fw, fh, lmFile, FaceMesh.LM_SIZE, FaceMesh.LM_SIZE);
+        if (model[2] == null) model[2] = new Yseg(assets, "face_landmarks.bin");
+        float[] out = model[2].runRaw(lcrop, FaceMesh.LM_SIZE, FaceMesh.LM_SIZE, FaceMesh.LM_FLOATS);
+        if (FaceMesh.presence(out) < 0.5f) return false;
+        float[] pts = FaceMesh.landmarks(out, lmFile);
+        float toMask = (float) qw / fw;
+        for (int k = 0; k < pts.length; k++) pts[k] *= toMask;
+        mesh.addFace(pts, faceMesh);
+        return true;
     }
 
     /** Maps upright copy coordinates to the file's own orientation (continuous pixel coordinates). */

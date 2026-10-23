@@ -171,6 +171,66 @@ public class FaceMesh {
         return p;
     }
 
+    /**
+     * Square crops covering a whole w x h image at two sizes (the short side, then half of it, overlapping), as
+     * squareCrop maps, so the detector can find faces anywhere without the people model.
+     */
+    public static java.util.List<double[]> tiles(int w, int h) {
+        java.util.List<double[]> out = new java.util.ArrayList<double[]>();
+        double big = Math.min(w, h);
+        addRow(out, w, h, big, 1.0);
+        addRow(out, w, h, big / 2, 1.0);
+        return out;
+    }
+
+    private static void addRow(java.util.List<double[]> out, int w, int h, double side, double step) {
+        int nx = Math.max(1, (int) Math.ceil((w - side) / (side * step)) + 1);
+        int ny = Math.max(1, (int) Math.ceil((h - side) / (side * step)) + 1);
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                double x = nx == 1 ? (w - side) / 2 : (w - side) * i / (nx - 1);
+                double y = ny == 1 ? (h - side) / 2 : (h - side) * j / (ny - 1);
+                out.add(squareCrop(x, y, side, DET_SIZE));
+            }
+        }
+    }
+
+    /** The faces left after dropping overlapping duplicates (keeping the higher score), biggest first, at most max. */
+    public static java.util.List<Face> merge(java.util.List<Face> faces, int max) {
+        java.util.List<Face> sorted = new java.util.ArrayList<Face>(faces);
+        java.util.Collections.sort(sorted, new java.util.Comparator<Face>() {
+            public int compare(Face a, Face b) {
+                return Float.compare(b.score, a.score);
+            }
+        });
+        java.util.List<Face> kept = new java.util.ArrayList<Face>();
+        for (Face f : sorted) {
+            boolean dup = false;
+            for (Face k : kept) {
+                if (iou(f, k) > 0.3f) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) kept.add(f);
+        }
+        java.util.Collections.sort(kept, new java.util.Comparator<Face>() {
+            public int compare(Face a, Face b) {
+                return Float.compare(b.w * b.h, a.w * a.h);
+            }
+        });
+        return kept.size() > max ? kept.subList(0, max) : kept;
+    }
+
+    private static float iou(Face a, Face b) {
+        float ax0 = a.cx - a.w / 2, ax1 = a.cx + a.w / 2, ay0 = a.cy - a.h / 2, ay1 = a.cy + a.h / 2;
+        float bx0 = b.cx - b.w / 2, bx1 = b.cx + b.w / 2, by0 = b.cy - b.h / 2, by1 = b.cy + b.h / 2;
+        float iw = Math.min(ax1, bx1) - Math.max(ax0, bx0), ih = Math.min(ay1, by1) - Math.max(ay0, by0);
+        if (iw <= 0 || ih <= 0) return 0;
+        float inter = iw * ih;
+        return inter / (a.w * a.h + b.w * b.h - inter);
+    }
+
     /** Converts a face found in a DET_SIZE crop (cropped by squareCrop map m) to source pixels. */
     public static Face toSource(Face f, double[] m) {
         Face o = new Face();

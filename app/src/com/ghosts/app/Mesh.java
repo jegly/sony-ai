@@ -27,6 +27,14 @@ public class Mesh {
     private final List<float[]> extraLines = new ArrayList<float[]>();
     private final List<float[]> extraDots = new ArrayList<float[]>();
     private int faces;
+    // face outlines, to dim the face under its mesh when there is no body figure (the Face mesh look)
+    private final List<float[][]> ovals = new ArrayList<float[][]>();
+    private float faceDim;
+
+    /** Dims each face under its mesh by this much (0..1); used when only faces are meshed. */
+    public void setFaceDim(float d) {
+        faceDim = d;
+    }
 
     public Mesh(byte[] mask, int mw, int mh, float dim, int glowLevel, float[] colour, long seed) {
         this.mw = mw;
@@ -106,6 +114,7 @@ public class Mesh {
             ox[i] = pts[2 * mesh.oval[i]];
             oy[i] = pts[2 * mesh.oval[i] + 1];
         }
+        ovals.add(new float[][] {ox, oy});
         if (hidden == null) hidden = new boolean[px.length];
         for (int i = 0; i < px.length; i++) if (inPolygon(px[i], py[i], ox, oy)) hidden[i] = true;
         java.util.Iterator<int[]> it = edges.iterator();
@@ -134,6 +143,22 @@ public class Mesh {
 
     public int faces() {
         return faces;
+    }
+
+    private static float[] bounds(float[][] o) {
+        float[] b = {Float.MAX_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
+        for (int i = 0; i < o[0].length; i++) {
+            b[0] = Math.min(b[0], o[0][i]);
+            b[1] = Math.min(b[1], o[1][i]);
+            b[2] = Math.max(b[2], o[0][i]);
+            b[3] = Math.max(b[3], o[1][i]);
+        }
+        return b;
+    }
+
+    private boolean insideFace(float x, float y) {
+        for (float[][] o : ovals) if (inPolygon(x, y, o[0], o[1])) return true;
+        return false;
     }
 
     private static boolean inPolygon(float x, float y, float[] ox, float[] oy) {
@@ -223,8 +248,13 @@ public class Mesh {
         }
         for (float[] d : extraDots) drawDot(d[0] * sxs, d[1] * sys, half * 1.1f, 0.8f, y, count, w);
 
+        float[][] boxes = new float[ovals.size()][];
+        for (int k = 0; k < boxes.length; k++) boxes[k] = bounds(ovals.get(k));
         for (int row = 0; row < count; row++) {
             int yy = y + row;
+            boolean faceRow = false;
+            float my = yy * (float) mh / h;
+            for (float[] bx : boxes) if (my >= bx[1] && my <= bx[3]) faceRow = true;
             float sy = (yy + 0.5f) * mh / h - 0.5f;
             if (sy < 0) sy = 0;
             int iy = Math.min(mh - 1, (int) sy);
@@ -237,6 +267,12 @@ public class Mesh {
                 float wx = fx[x];
                 float dPx = lerp2(dist, a0, a1, b0, b1, wx, wy) * sxs;
                 float l = light[base + x];
+                if (faceRow && faceDim > 0 && insideFace(x * (float) mw / w, my)) {
+                    int c = rgb[base + x];
+                    float k = 1 - faceDim;
+                    rgb[base + x] = (c & 0xFF000000) | (clamp(((c >> 16) & 255) * k) << 16) | (clamp(((c >> 8) & 255) * k) << 8)
+                            | clamp((c & 255) * k);
+                }
                 if (dPx < -outlineHalf * 8 && l == 0) continue;
                 float a = lerp2(alpha, a0, a1, b0, b1, wx, wy);
                 float outline = line(Math.abs(dPx), outlineHalf);

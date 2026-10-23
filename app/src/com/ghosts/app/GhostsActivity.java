@@ -77,7 +77,7 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
             "Live", "Soft skin", "WB", "Kelvin", "D-Range"};
     private static final int ROW_PEOPLE = 0, ROW_DIFFUSION = 1, ROW_MODEL = 2, ROW_LOOK = 3, ROW_OPACITY = 4, ROW_COLOUR = 5,
             ROW_GLOW = 6, ROW_SIZE = 7, ROW_LIVE = 8, ROW_SKIN = 9, ROW_WB = 10, ROW_KELVIN = 11, ROW_DRO = 12;
-    private static final String[] PEOPLE_NAMES = {"Off", "Ghosts", "Wireframe", "Contours"};
+    private static final String[] PEOPLE_NAMES = {"Off", "Ghosts", "Wireframe", "Contours", "Face mesh"};
     private static final int[] MODEL_SIZES = {320, 480, 640};
     private static final String[] MODEL_NAMES = {"Fast", "Normal", "Fine"};
     private static final String[] MODEL_NOTES = {"320 px, finds fewer people", "480 px", "640 px, slowest, finds the most people"};
@@ -484,7 +484,8 @@ public class GhostsActivity extends Activity implements SurfaceHolder.Callback, 
         boolean ghostsOn = people == Ghoster.PEOPLE_GHOSTS, peopleOn = people != Ghoster.PEOPLE_OFF;
         String[] values = {
             PEOPLE_NAMES[people] + (people == Ghoster.PEOPLE_WIREFRAME ? "  (triangle mesh, face mesh on faces)"
-                    : people == Ghoster.PEOPLE_CONTOURS ? "  (scan lines)" : ""),
+                    : people == Ghoster.PEOPLE_CONTOURS ? "  (scan lines)"
+                    : people == Ghoster.PEOPLE_FACES ? "  (faces only, quicker)" : ""),
             Diffusion.NAMES[diffusion] + (diffusion > 0 && !peopleOn ? "  (no AI, quick)" : ""),
             MODEL_NAMES[model] + "  (" + MODEL_NOTES[model] + ")",
             Ghost.LOOKS[look] + "  (" + LOOK_NOTES[look] + ")",
