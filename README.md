@@ -1,10 +1,10 @@
 # sony-ai
 
-AI effects that run on the Sony A7 II itself. No phone, no computer, no cloud. You take a photo, and a few seconds later the camera saves a copy with the effect.
+AI effects that run on the Sony A7XX series.
 
 The main app is called **Ghosts**. It started as one idea (turn the people in a busy street into glowing white figures) and grew from there.
 
-The A7 II runs Android 4.1 on a Cortex-A5 chip with no NEON, so normal AI runtimes like LiteRT won't run on it. This repo has a small engine written in plain C that runs YOLO and MediaPipe models on that chip, plus the app that uses it.
+The A7II runs Android 4.1 on a Cortex-A5 chip with no NEON, This repo has a small engine written in plain C that runs YOLO and MediaPipe models on that chip, plus the app that uses it.
 
 ## What it does
 
@@ -96,7 +96,7 @@ python tools/lower_tflite.py face_landmarks_detector.tflite model/face_landmarks
 
 - YOLO11n-seg and YOLO11n-pose by [Ultralytics](https://github.com/ultralytics/ultralytics), AGPL-3.0
 - Face detector, face landmark model and face mesh map by Google [MediaPipe](https://github.com/google-ai-edge/mediapipe), Apache-2.0
-- [Sony-PMCA-RE](https://github.com/ma1co/Sony-PMCA-RE) and [OpenMemories](https://github.com/ma1co/OpenMemories-Framework) by ma1co made installing apps on these cameras possible
-- The camera code is shared with [sonyalpha-film](https://github.com/jegly/sonyalpha-film)
+- [Sony-PMCA-RE](https://github.com/ma1co/Sony-PMCA-RE) and [OpenMemories](https://github.com/ma1co/OpenMemories-Framework) by ma1co made installing apps on these cameras possible <3 <3 <3
+- The camera code is shared with [sonyalpha-film](https://github.com/jegly/sonyalpha-film) 
 
 Because it ships the YOLO models, this project is licensed under the AGPL-3.0. See `LICENSE` and `NOTICE`.
