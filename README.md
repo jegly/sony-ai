@@ -4,7 +4,7 @@ AI effects that run on the Sony A7XX series.
 
 The main app is called **Ghosts**. It started as one idea (turn the people in a busy street into glowing white figures) and grew from there.
 
-The A7II runs Android 4.1 on a Cortex-A5 chip with no NEON, This repo has a small engine written in plain C that runs YOLO and MediaPipe models on that chip, plus the app that uses it.
+The A7II runs Android 4.1 on a Cortex-A5 chip with no NEON, This repo has a small engine written in plain C that runs YOLO and MediaPipe models on that chip, plus the app that uses it !
 
 ## What it does
 
